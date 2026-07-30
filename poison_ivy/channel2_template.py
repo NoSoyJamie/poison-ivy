@@ -1,10 +1,9 @@
 """
 Channel 2 (RFCOMM server channel 2, the proprietary command channel --
-DLCI 4 in the original capture) is where the interesting open question
-in this project used to live. As of the second capture (a genuinely
-successful print, captured start to finish including a deliberate
-"no paper loaded" error state beforehand for comparison), it's mostly
-resolved:
+DLCI 4 in the original capture) carries a mostly-understood command
+sequence, but with one important correction to earlier conclusions in
+this file -- read the whole thing, not just the "what's understood"
+list, if you're trying to make sense of past debugging notes.
 
 What's understood:
   - Small 34-byte command frames, all prefixed with the same 4-byte
@@ -15,45 +14,28 @@ What's understood:
   - One specific 34-byte frame announces a size that matches the OBEX
     Length header exactly (the size of the photo being pushed over
     channel 4). This module locates and patches that field for a new
-    image.
-  - A genuinely successful real print (captured end to end) showed
-    channel 2 consisting of ONLY: a mux/session setup, a long run of
-    repeated status-poll commands (0x0101) before and after the one
-    size-announce command, and teardown. No large data chunks at all.
-  - The FIRST capture this project was originally built from (see
-    tools/) DID include ~106KB of low-entropy "raster-looking" bulk
-    data after its size-announce command, which earlier versions of
-    this code assumed was necessary and copied verbatim into every
-    session. Comparing against the second (clean) capture strongly
-    suggests that assumption was wrong: that bulk data is not part of
-    normal print flow. The current best theory is that it was
-    specific to whatever unusual condition applied to that first
-    session (possibly a one-time calibration/sync tied to first
-    connection after pairing, or something related to freshly-loaded
-    paper) rather than something every print needs. Sending it
-    unconditionally on every print, as this project used to do, is
-    the likely cause of `print.py` runs that connected and sent data
-    successfully but the printer blinked red and nothing printed --
-    the printer's status replies during those failures showed a
-    distinct error byte (`...8403f7...`) that never appears in either
-    a real successful print OR a real "no paper loaded" error state,
-    both of which show `...8403de...` instead. That's consistent with
-    the printer flagging the extra, unexpected bulk data as invalid,
-    not a paper/cover/battery condition.
-  - This module now ships the minimal, clean template (~3.5KB) instead
-    of the old ~110KB one. If you still have the old template lying
-    around from before this fix, it's worth discarding.
+    image -- that's this module's whole job.
 
-Still open / not fully certain:
-  - Why the very first capture included that bulk data at all. If you
-    can reproduce it (e.g. by capturing the very first print after a
-    fresh pairing, or the very first print on a freshly-opened pack of
-    paper), that would help confirm or rule out either theory. Open an
-    issue with the capture if you get one.
-  - The exact meaning of most other fields in the 34-byte command
-    frames beyond the ones described above (there's a byte that looks
-    like it might be tracking battery percentage during a print job --
-    see PROTOCOL.md).
+Correction: a status-reply byte this project previously treated as an
+error indicator (`...8403f7...` vs `...8403de...`) turned out to
+appear identically in both successful and failed real prints when
+compared directly. It is NOT a reliable success/failure signal --
+don't use it to judge whether a print worked.
+
+The actual confirmed factor is size proximity: this project ships a
+~112KB template (`data/channel2_payload.bin`) captured alongside one
+specific ~198,784-byte source image, including a large block of
+still-undeciphered data after the size-announce command. Physical
+print success has been confirmed to depend on how close the NEW
+image's size is to that original ~198,784 bytes -- an image re-encoded
+down to ~203KB printed successfully; the same image at its natural
+~830KB size did not, with an otherwise identical, cleanly-completing
+Bluetooth exchange either way. See PROTOCOL.md for the full writeup.
+
+Practical consequence: `poison_ivy/image_prep.py` now automatically
+re-encodes images to stay close to that original size by default
+(see its `max_preview_bytes` / `DEFAULT_MAX_PREVIEW_BYTES`), rather
+than leaving you to discover this the hard way per image.
 """
 
 LENGTH_FIELD_MARKER = bytes.fromhex("1b2a434100010000")  # magic + 0001 00 00

@@ -44,10 +44,9 @@ See `poison_ivy/obex_push.py`.
 
 ## Channel 2: proprietary command channel
 
-Mostly understood now, as of a second capture that included a real,
-deliberately-triggered error state (no paper loaded) followed by a
-genuinely successful print, captured start to finish for comparison
-against the original capture this project was first built from.
+Partially understood, and the history of getting here is worth reading
+since a couple of earlier conclusions in this file turned out to be
+wrong -- corrected below rather than silently rewritten.
 
 ### Small command frames
 
@@ -80,53 +79,76 @@ the start of a real print job and drifts down (`0x63`, `0x56`, `0x37`,
 head. Not confirmed against an actual displayed battery percentage,
 but the values and direction line up.
 
-### The "bulk data chunks" question -- resolved (mostly)
+### Correction: the `0x...8403f7...` status byte is NOT an error indicator
 
-The original capture this project was built from had ~110 chunks of
-~980 bytes each (~106KB total) on this channel, after the small
-commands and before the size-announce frame. Earlier versions of this
-project assumed that was a required part of every print and copied it
-verbatim into every session `print.py` sent.
+An earlier version of this file claimed a specific status reply byte
+pattern (`...8403f7...`) only ever appeared in failed print attempts,
+versus `...8403de...` in successful ones, and treated it as the key
+diagnostic signal for a long stretch of this project's debugging.
 
-**A second, independently captured session -- a real print that was
-confirmed to work, captured end to end via `adb bugreport` -- had
-zero bulk data chunks on this channel.** Its channel 2 traffic was
-just: mux/session setup, a long run of status polls, one size-announce
-command, more status polls, teardown. No large chunks anywhere.
+**This was wrong.** A directly comparable pair of `btmon` captures --
+one running `replay_print.py` (confirmed to reliably produce a
+physical print) and one running the custom-image tool on the same
+printer in the same session (confirmed NOT to physically print) --
+show `...8403f7...` in the *first* reply of **both** sessions,
+identically. The OBEX transfer completes with the same clean success
+sequence in both cases too. At the Bluetooth protocol level these two
+sessions are not meaningfully different. Do not use this byte as a
+success/failure signal; what it actually indicates is still unknown.
 
-This strongly suggests the bulk data in the first capture was NOT a
-normal part of every print, and that `print.py` sending it
-unconditionally on every image was actively wrong -- and likely the
-cause of failures where the tool would connect and send data
-successfully, but the printer would blink red and never physically
-print. Supporting evidence: those failures' status replies consistently
-showed `...8403f7...`, a byte pattern that has never appeared in any
-real capture from the official app -- not during a successful print,
-and not even during a real, deliberately-triggered "no paper loaded"
-error (which instead shows `...8403de01...`, using the same `de` byte
-seen in ordinary successful prints, just with a trailing flag set).
-That's consistent with the printer flagging the extra, unexpected data
-as invalid, rather than any paper/cover/battery condition.
+### The size/print-success finding (confirmed)
 
-`poison_ivy/channel2_template.py` now ships the clean, minimal
-template (~3.5KB) recovered from the second capture instead of the
-original ~110KB one.
+This is the actual, confirmed, actionable discovery, arrived at only
+after the above correction forced a rethink of what was actually
+different between working and non-working sessions.
 
-**Still open:** why the very first capture had that bulk data at all.
-Current best guesses, unconfirmed: something tied to the first
-connection after a fresh pairing, or something tied to a freshly
-opened pack of paper needing an initial calibration pass (Canon's
-ZINK "SMART SHEET" paper is documented elsewhere as needing this).
-Notably, the second capture's session *also* involved a fresh paper
-load partway through -- the printer visibly ran a blank calibration
-page through on its own right after the cover was closed -- and still
-showed no extra channel-2 data at all, which argues against the
-paper-calibration theory specifically, since that calibration pass
-seems to be something the printer does internally rather than
-something the app sends extra data for. If you can reproduce the
-original bulk-data behavior (e.g. by capturing the very first print
-after a completely fresh pairing), that would help settle it -- please
-open an issue with the capture if you get one.
+Every print that has ever failed to physically produce paper (while
+completing a clean Bluetooth exchange) reused this project's captured
+channel-2 template -- including its bulk data-like content -- while
+announcing (via the size-announce field above) a size very different
+from the ~198,784 bytes that data was originally captured alongside.
+Every print confirmed to work used either that same original size
+unchanged (`replay_print.py`, which doesn't patch anything), or a new
+image deliberately re-encoded down to land close to it.
+
+Concretely: a Magic card image that failed to print at its natural
+~830KB re-encoded size printed successfully once brought down to
+~203KB (JPEG quality 30) with nothing else about the process changed.
+
+Working theory: the channel-2 data isn't literally irrelevant to
+image content (an earlier, now-superseded theory in this file claimed
+it was), and the printer's physical print engine -- a separate stage
+from the Bluetooth transfer, which is why the connection and OBEX
+transfer always complete cleanly regardless -- silently fails when
+the announced size diverges too far from what that reused data
+actually corresponds to. The Bluetooth-level exchange gives no visible
+error either way.
+
+**Practical fix, implemented:** `poison_ivy/image_prep.py` now
+automatically lowers JPEG quality (via `max_preview_bytes`, default
+400KB) to keep the pushed image size within the confirmed-working
+range, rather than requiring you to guess a quality setting per
+image. See that module's docstring for the current constant.
+
+**Update: the size boundary has now been bracketed.** Binary search
+on a real printer (repeated print attempts at decreasing `--max-size`
+values, using `akh-225-bontu-s-monument.png` as the test image)
+narrowed it to: confirmed working up to 424,063 bytes, confirmed
+failing at 432,500 bytes -- a gap under 2%. `DEFAULT_MAX_PREVIEW_BYTES`
+is now 400,000, giving a reasonable safety margin below the
+confirmed-good point. This was bracketed against one image's
+compression curve, not a universal constant -- different content may
+shift the true boundary slightly, so treat 400,000 as a well-tested
+estimate rather than a hardware-guaranteed number.
+
+**Still open / not confirmed:**
+- Why an earlier `gawr.webp` print (~449KB) worked once and then
+  later failed on retry with nothing changed. This may indicate a
+  second, separate factor (some kind of printer-side state drift)
+  layered on top of the size effect, not yet isolated.
+- What the channel-2 bulk data chunks actually encode. Still unknown;
+  seemingly not literally irrelevant (see above), but not decoded
+  either.
 
 ## Capturing your own session
 
