@@ -1,3 +1,5 @@
+This project is 100% certified Claude AI slop, it works for what I want it for, but use it at your own risk.
+
 # Poison Ivy 🌿
 
 Print to a Canon IVY mini photo printer from Linux over Bluetooth,
