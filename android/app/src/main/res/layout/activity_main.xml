@@ -59,9 +59,38 @@
             android:layout_height="200dp"
             android:layout_marginTop="8dp"
             android:layout_marginBottom="8dp"
-            android:scaleType="centerInside"
+            android:scaleType="fitCenter"
             android:background="#EEEEEE"
-            android:contentDescription="Selected image preview" />
+            android:contentDescription="Preview of exactly what will print" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="This preview shows exactly the framing/rotation that will print. If it comes out wrong on paper, rotate here to match -- the app will remember your choice."
+            android:textSize="12sp"
+            android:layout_marginBottom="4dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:layout_marginBottom="8dp">
+
+            <Button
+                android:id="@+id/rotateButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Rotate 90°" />
+
+            <TextView
+                android:id="@+id/rotationLabel"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Rotation: 0°"
+                android:layout_marginStart="12dp"
+                android:textStyle="bold" />
+        </LinearLayout>
 
         <Button
             android:id="@+id/pickImageButton"

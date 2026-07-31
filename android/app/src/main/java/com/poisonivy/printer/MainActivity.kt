@@ -35,6 +35,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var selectedDeviceText: TextView
     private lateinit var selectDeviceButton: Button
     private lateinit var imagePreview: ImageView
+    private lateinit var rotateButton: Button
+    private lateinit var rotationLabel: TextView
     private lateinit var pickImageButton: Button
     private lateinit var padCheckbox: CheckBox
     private lateinit var padColorGroup: RadioGroup
@@ -44,6 +46,7 @@ class MainActivity : AppCompatActivity() {
 
     private var selectedDevice: BluetoothDevice? = null
     private var selectedImageUri: Uri? = null
+    private var rotationDegrees: Int = 0
 
     private var discoveryReceiver: BroadcastReceiver? = null
     private var discoveryDialog: AlertDialog? = null
@@ -72,7 +75,9 @@ class MainActivity : AppCompatActivity() {
     ) { uri ->
         if (uri != null) {
             selectedImageUri = uri
-            imagePreview.setImageURI(uri)
+            rotationDegrees = 0
+            updateRotationLabel()
+            refreshPreview()
             updatePrintButtonEnabled()
         }
     }
@@ -84,6 +89,8 @@ class MainActivity : AppCompatActivity() {
         selectedDeviceText = findViewById(R.id.selectedDeviceText)
         selectDeviceButton = findViewById(R.id.selectDeviceButton)
         imagePreview = findViewById(R.id.imagePreview)
+        rotateButton = findViewById(R.id.rotateButton)
+        rotationLabel = findViewById(R.id.rotationLabel)
         pickImageButton = findViewById(R.id.pickImageButton)
         padCheckbox = findViewById(R.id.padCheckbox)
         padColorGroup = findViewById(R.id.padColorGroup)
@@ -94,6 +101,49 @@ class MainActivity : AppCompatActivity() {
         selectDeviceButton.setOnClickListener { requestPermissionsThenShowDevices() }
         pickImageButton.setOnClickListener { pickImageLauncher.launch("image/*") }
         printButton.setOnClickListener { startPrint() }
+
+        rotateButton.setOnClickListener {
+            rotationDegrees = (rotationDegrees + 90) % 360
+            updateRotationLabel()
+            refreshPreview()
+        }
+        padCheckbox.setOnCheckedChangeListener { _, _ -> refreshPreview() }
+        padColorGroup.setOnCheckedChangeListener { _, _ -> refreshPreview() }
+    }
+
+    private fun updateRotationLabel() {
+        rotationLabel.text = "Rotation: ${rotationDegrees}°"
+    }
+
+    /**
+     * Regenerates the preview using the EXACT same function that builds
+     * what actually gets sent to the printer (ImagePrep.preparePreviewBitmap),
+     * with the currently selected rotation/pad options. This is what makes
+     * the on-screen preview a reliable stand-in for the physical printout --
+     * if it looks right here, rotated correctly, it should print that way.
+     */
+    private fun refreshPreview() {
+        val uri = selectedImageUri ?: return
+        val padTo2x3 = padCheckbox.isChecked
+        val padColor = if (padColorGroup.checkedRadioButtonId == R.id.padColorBlack) Color.BLACK else Color.WHITE
+        val rotation = rotationDegrees
+
+        lifecycleScope.launch {
+            try {
+                val bitmap = withContext(Dispatchers.IO) {
+                    ImagePrep.preparePreviewBitmap(
+                        context = this@MainActivity,
+                        uri = uri,
+                        rotationDegrees = rotation,
+                        padTo2x3 = padTo2x3,
+                        padFillColor = padColor,
+                    )
+                }
+                imagePreview.setImageBitmap(bitmap)
+            } catch (e: Exception) {
+                log("Could not generate preview: ${e.message}")
+            }
+        }
     }
 
     // ---------------------------------------------------------------
@@ -236,6 +286,7 @@ class MainActivity : AppCompatActivity() {
         val padTo2x3 = padCheckbox.isChecked
         val padColor = if (padColorGroup.checkedRadioButtonId == R.id.padColorBlack) Color.BLACK else Color.WHITE
         val maxSize = maxSizeInput.text.toString().toIntOrNull() ?: ImagePrep.DEFAULT_MAX_PREVIEW_BYTES
+        val rotation = rotationDegrees
 
         printButton.isEnabled = false
         statusLog.text = ""
@@ -247,6 +298,7 @@ class MainActivity : AppCompatActivity() {
                     ImagePrep.prepareImage(
                         context = this@MainActivity,
                         uri = uri,
+                        rotationDegrees = rotation,
                         padTo2x3 = padTo2x3,
                         padFillColor = padColor,
                         maxPreviewBytes = maxSize,

@@ -22,6 +22,22 @@ import java.io.ByteArrayOutputStream
  * too far from that -- specifically, confirmed working up to 424,063
  * bytes and confirmed failing at 432,500 bytes. DEFAULT_MAX_PREVIEW_BYTES
  * below matches the Python project's bracketed-and-tested default.
+ *
+ * On rotation/orientation: the printed sheet is always physically
+ * 2:3 (2in x 3in), but source images (card scans especially) aren't
+ * always already in that orientation, and there's evidence the
+ * printer/protocol may have its own fixed orientation expectations
+ * independent of anything in the source file (the very first image
+ * this whole project's protocol was reverse-engineered from was
+ * itself stored sideways relative to how a person would naturally
+ * view it). `rotationDegrees` lets the caller (the UI, ultimately the
+ * person using the app) rotate the source before cropping, and
+ * MainActivity generates its live preview using the exact same
+ * function used to build what actually gets sent -- see
+ * preparePreviewBitmap() -- so what you see is what prints. There is
+ * currently no known-correct default rotation baked in here; it's
+ * 0 (no extra rotation beyond EXIF correction) until calibrated
+ * against a real test print.
  */
 object ImagePrep {
 
@@ -75,6 +91,19 @@ object ImagePrep {
     }
 
     /**
+     * Rotates a bitmap by an arbitrary multiple of 90 degrees
+     * (0, 90, 180, or 270; other values are normalized into that set).
+     * Returns the same bitmap unchanged for a 0-degree rotation.
+     */
+    fun rotateBitmap(source: Bitmap, degrees: Int): Bitmap {
+        val normalized = ((degrees % 360) + 360) % 360
+        if (normalized == 0) return source
+        val matrix = Matrix()
+        matrix.postRotate(normalized.toFloat())
+        return Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
+    }
+
+    /**
      * Scales `source` to fill (autoCrop=true) or fit (autoCrop=false)
      * a targetW x targetH box, center-cropping or center-padding as
      * needed, mirroring Python's _crop_resize.
@@ -105,12 +134,6 @@ object ImagePrep {
         val offsetY = (targetH - scaledH) / 2
         c.drawBitmap(scaledBitmap, offsetX.toFloat(), offsetY.toFloat(), null)
         return canvas
-    }
-
-    private fun rotate180(source: Bitmap): Bitmap {
-        val matrix = Matrix()
-        matrix.postRotate(180f)
-        return Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
     }
 
     private fun encodeJpeg(bitmap: Bitmap, quality: Int): ByteArray {
@@ -154,10 +177,50 @@ object ImagePrep {
         return Pair(bestQ, bestBytes)
     }
 
+    private fun loadAndOrient(context: Context, uri: Uri, rotationDegrees: Int): Bitmap {
+        val inputStream = context.contentResolver.openInputStream(uri)
+            ?: throw IllegalArgumentException("Could not open image at $uri")
+        var src = inputStream.use { android.graphics.BitmapFactory.decodeStream(it) }
+            ?: throw IllegalArgumentException("Could not decode image at $uri")
+
+        // Respect EXIF orientation first (how the source file says it should
+        // be displayed), THEN apply the caller/user's chosen rotation on top.
+        src = applyExifOrientation(context, uri, src)
+        src = rotateBitmap(src, rotationDegrees)
+        return src
+    }
+
+    /**
+     * Produces exactly the 1280x1920 bitmap that will be encoded and
+     * pushed to the printer as "preview" -- i.e. the actual print
+     * content, before JPEG compression. Use this to render a live,
+     * accurate preview in the UI: whatever this returns is what will
+     * print, framed exactly as it will be framed.
+     */
+    fun preparePreviewBitmap(
+        context: Context,
+        uri: Uri,
+        rotationDegrees: Int = 0,
+        autoCrop: Boolean = true,
+        padTo2x3: Boolean = false,
+        padFillColor: Int = Color.WHITE,
+    ): Bitmap {
+        var src = loadAndOrient(context, uri, rotationDegrees)
+        if (padTo2x3) {
+            src = padToRatio(src, 2, 3, padFillColor)
+        }
+        return cropResize(src, PREVIEW_WIDTH, PREVIEW_HEIGHT, autoCrop)
+    }
+
     /**
      * Loads an image from a content Uri (e.g. from the system image
      * picker) and produces the two JPEG buffers the printer expects.
      *
+     * @param rotationDegrees rotate the source by this many degrees
+     *   (0/90/180/270) before cropping -- see the class-level kdoc for
+     *   why this exists and how to calibrate it. Should match whatever
+     *   was last shown via preparePreviewBitmap() so the physical
+     *   print matches what the user confirmed on screen.
      * @param padTo2x3 letterbox the source to exactly 2:3 before
      *   anything else, so autoCrop can't cut into it. Use for content
      *   with a fixed aspect ratio you don't want trimmed (card scans).
@@ -170,29 +233,17 @@ object ImagePrep {
     fun prepareImage(
         context: Context,
         uri: Uri,
+        rotationDegrees: Int = 0,
         autoCrop: Boolean = true,
         quality: Int = 95,
         padTo2x3: Boolean = false,
         padFillColor: Int = Color.WHITE,
         maxPreviewBytes: Int? = DEFAULT_MAX_PREVIEW_BYTES,
     ): PreparedImage {
-        val inputStream = context.contentResolver.openInputStream(uri)
-            ?: throw IllegalArgumentException("Could not open image at $uri")
-        var src = inputStream.use { android.graphics.BitmapFactory.decodeStream(it) }
-            ?: throw IllegalArgumentException("Could not decode image at $uri")
-
-        // Respect EXIF orientation, same as PIL effectively does via
-        // ImageOps.exif_transpose in a fuller pipeline -- Android's
-        // BitmapFactory does NOT auto-rotate, so do it explicitly.
-        src = applyExifOrientation(context, uri, src)
-
-        if (padTo2x3) {
-            src = padToRatio(src, 2, 3, padFillColor)
-        }
-
-        val preview = cropResize(src, PREVIEW_WIDTH, PREVIEW_HEIGHT, autoCrop)
-        val final = rotate180(
-            Bitmap.createScaledBitmap(preview, FINAL_WIDTH, FINAL_HEIGHT, true)
+        val preview = preparePreviewBitmap(context, uri, rotationDegrees, autoCrop, padTo2x3, padFillColor)
+        val final = rotateBitmap(
+            Bitmap.createScaledBitmap(preview, FINAL_WIDTH, FINAL_HEIGHT, true),
+            180,
         )
 
         val (usedQuality, previewBytes) = if (maxPreviewBytes != null) {
@@ -214,14 +265,13 @@ object ImagePrep {
                 androidx.exifinterface.media.ExifInterface.TAG_ORIENTATION,
                 androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL
             )
-            val matrix = Matrix()
-            when (orientation) {
-                androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
-                androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
-                androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
-                else -> return bitmap
+            val degrees = when (orientation) {
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_90 -> 90
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_180 -> 180
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_270 -> 270
+                else -> 0
             }
-            Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+            rotateBitmap(bitmap, degrees)
         } catch (e: Exception) {
             // If EXIF reading fails for any reason, just use the bitmap as-is
             // rather than failing the whole print.
