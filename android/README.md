@@ -1,0 +1,108 @@
+# Poison Ivy (Android)
+
+A simple Android app version of the [Poison Ivy](https://github.com/NoSoyJamie/poison-ivy)
+Python project: prints to a Canon IVY mini photo printer over Bluetooth,
+straight from your phone's own photo picker.
+
+**Status: written but not yet built or tested on a real device.** This
+was put together without access to an Android SDK, emulator, or
+physical device -- see [Known limitations](#known-limitations) below
+before you assume anything here is proven. The underlying protocol
+logic (image prep, OBEX push, channel-2 template patching) is a
+faithful, careful port of the Python project's code, which *is*
+proven against a real printer. What's genuinely new and unverified is
+the Android-specific plumbing around it: Bluetooth permissions,
+device discovery, and -- most importantly -- whether
+`createRfcommSocketToServiceRecord` actually resolves to the right
+RFCOMM channels on this printer (see below).
+
+## What it does
+
+- Lists your phone's paired Bluetooth devices (and can actively scan
+  for/pair new ones) so you can pick the printer.
+- Opens the system image picker -- any photo, any app that exposes
+  images (Gallery, Files, Google Photos, etc).
+- Options: pad-to-2:3 (for card scans, so nothing gets cropped), pad
+  bar color, and max output size in bytes (defaults to 400,000, the
+  Python project's tested-safe value).
+- Sends the print job over Bluetooth using the same protocol logic as
+  the Python tool.
+
+## Known limitations
+
+1. **Never built or run.** I don't have an Android toolchain in the
+   environment I wrote this in. The Kotlin has been checked carefully
+   by hand (balanced braces, correct imports, consistent types) but
+   that's not the same as a compiler actually accepting it. Expect to
+   fix at least a few small build errors on first import into Android
+   Studio -- that's normal for hand-written code that's never been
+   compiled, not a sign anything is fundamentally wrong.
+
+2. **The RFCOMM channel resolution is the biggest open question.**
+   The Python project connects to hardcoded RFCOMM channel numbers (2
+   and 4) using raw sockets, which Android's public API doesn't
+   support directly. This app instead connects via the standard
+   Bluetooth service UUIDs the printer itself advertises over SDP
+   ("Serial Port" 0x1101 and "OBEX Object Push" 0x1105, confirmed via
+   `bluetoothctl info` in the Python project's own debugging) and lets
+   Android's Bluetooth stack resolve the actual channel. This *should*
+   land on channels 2 and 4 respectively, since that's what those
+   services corresponded to when captured -- but it's untested. If
+   printing fails in a way that looks like a connection problem (can't
+   connect, or connects to the wrong thing), see the documented
+   fallback in `BluetoothPrinter.kt` (an unofficial but commonly-used
+   reflection-based method to specify the channel number directly).
+
+3. **No image-picker crop/rotate preview**, no print history, no
+   fancy UI -- this was built to the letter of "simple," not more.
+
+## Building it
+
+You'll need [Android Studio](https://developer.android.com/studio)
+(free). Rough steps:
+
+1. Install Android Studio, let it install the Android SDK during
+   first-run setup if you don't have one already.
+2. Open Android Studio -> **Open** -> select this project's root
+   folder (the one with `settings.gradle.kts` in it).
+3. Let Gradle sync. It'll download dependencies over the internet the
+   first time -- give it a few minutes.
+4. If Gradle complains about a missing wrapper jar, use **File ->
+   Sync Project with Gradle Files**, or **File -> New -> Import
+   Project** and let Android Studio regenerate the wrapper.
+5. Fix whatever build errors show up (see note above -- there will
+   probably be a few small ones on a first-ever compile of hand-written
+   code). Paste them back if you want help.
+6. Connect your Android phone via USB with Developer Options + USB
+   debugging on (same as the `adb` setup from the Python project), or
+   use an emulator (though Bluetooth doesn't work in most emulators --
+   you'll want a real device to actually test printing).
+7. Click Run.
+
+## First run on your phone
+
+1. Pair the printer via Android's normal Bluetooth settings first if
+   you haven't already (same printer, same pairing process as always
+   -- nothing printer-specific about this step).
+2. Open the app, tap **Find printer**, select it from the list.
+3. Tap **Pick image**, choose a photo.
+4. Set options if needed (pad for card scans, adjust max size).
+5. Tap **Print**.
+
+## Relationship to the Python project
+
+This is a straight port of the same reverse-engineered protocol:
+
+| Python | Android (Kotlin) | Purpose |
+|---|---|---|
+| `poison_ivy/image_prep.py` | `ImagePrep.kt` | Crop/pad/resize/auto-size |
+| `poison_ivy/obex_push.py` | `ObexPush.kt` | OBEX byte stream builder |
+| `poison_ivy/channel2_template.py` | `Channel2Template.kt` | Size-field patcher |
+| `data/channel2_payload.bin` | `assets/channel2_payload.bin` | Same file, copied as-is |
+| `print.py` | `BluetoothPrinter.kt` + `MainActivity.kt` | Connection/send logic + UI |
+
+If you bracket a different size limit, decode more of the channel-2
+protocol, or fix a bug in one, please port the fix to the other --
+they're meant to stay in sync. See the Python project's `PROTOCOL.md`
+for the full technical writeup; nothing protocol-specific is
+duplicated here beyond what's needed for code comments.

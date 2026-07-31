@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/app_name"
+            android:textSize="22sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/tagline"
+            android:textSize="12sp"
+            android:layout_marginBottom="16dp" />
+
+        <!-- Printer selection -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Printer"
+            android:textStyle="bold"
+            android:layout_marginTop="8dp" />
+
+        <TextView
+            android:id="@+id/selectedDeviceText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="No printer selected"
+            android:layout_marginBottom="8dp" />
+
+        <Button
+            android:id="@+id/selectDeviceButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Find printer" />
+
+        <!-- Image selection -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Image"
+            android:textStyle="bold"
+            android:layout_marginTop="24dp" />
+
+        <ImageView
+            android:id="@+id/imagePreview"
+            android:layout_width="match_parent"
+            android:layout_height="200dp"
+            android:layout_marginTop="8dp"
+            android:layout_marginBottom="8dp"
+            android:scaleType="centerInside"
+            android:background="#EEEEEE"
+            android:contentDescription="Selected image preview" />
+
+        <Button
+            android:id="@+id/pickImageButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Pick image" />
+
+        <!-- Options -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Options"
+            android:textStyle="bold"
+            android:layout_marginTop="24dp" />
+
+        <CheckBox
+            android:id="@+id/padCheckbox"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Pad to 2:3 instead of cropping (use for card scans)"
+            android:layout_marginTop="8dp" />
+
+        <RadioGroup
+            android:id="@+id/padColorGroup"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginStart="32dp"
+            android:layout_marginBottom="8dp">
+
+            <RadioButton
+                android:id="@+id/padColorWhite"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="White bars"
+                android:checked="true" />
+
+            <RadioButton
+                android:id="@+id/padColorBlack"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Black bars"
+                android:layout_marginStart="16dp" />
+        </RadioGroup>
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Max file size (bytes) -- higher is better quality, but too high can silently fail to print. 400000 is a tested-safe default; confirmed working up to 424063, confirmed failing at 432500."
+            android:textSize="12sp"
+            android:layout_marginTop="8dp" />
+
+        <EditText
+            android:id="@+id/maxSizeInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:inputType="number"
+            android:text="400000"
+            android:hint="Max size in bytes" />
+
+        <!-- Print -->
+        <Button
+            android:id="@+id/printButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:text="Print"
+            android:enabled="false" />
+
+        <!-- Status log -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Status"
+            android:textStyle="bold"
+            android:layout_marginTop="24dp" />
+
+        <TextView
+            android:id="@+id/statusLog"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:padding="8dp"
+            android:background="#EEEEEE"
+            android:fontFamily="monospace"
+            android:textSize="11sp"
+            android:text="Ready." />
+
+    </LinearLayout>
+</ScrollView>
