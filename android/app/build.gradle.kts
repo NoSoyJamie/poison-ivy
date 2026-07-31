@@ -15,7 +15,29 @@ android {
         versionName = "1.0"
     }
 
+    signingConfigs {
+        getByName("debug") {
+            // Fixed, checked-in debug keystore (app/debug.keystore) instead of
+            // letting the Android Gradle Plugin auto-generate a random one per
+            // machine. Without this, every fresh environment -- including a
+            // brand new GitHub Actions runner on every single workflow run --
+            // signs debug builds with a different random key, and Android
+            // refuses to install a new APK over an old one with a different
+            // signature (INSTALL_FAILED_UPDATE_INCOMPATIBLE). This keystore is
+            // debug-only, not sensitive, and is meant to be shared/committed --
+            // same convention the Android SDK itself uses for its own
+            // auto-generated ~/.android/debug.keystore.
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("debug")
+        }
         release {
             isMinifyEnabled = false
         }
