@@ -9,9 +9,8 @@ import android.net.Uri
 import java.io.ByteArrayOutputStream
 
 /**
- * Port of poison_ivy/image_prep.py. Prepares an arbitrary source
- * image for the Canon IVY, replicating the same crop/resize steps
- * the Python tool (and the official app) use.
+ * Port of poison_ivy/image_prep.py, extended with interactive
+ * pinch-zoom/rotate/pan framing (see InteractivePreviewView).
  *
  * See the Python project's PROTOCOL.md for the full story on why
  * output SIZE matters here, not just correctness: channel 2's
@@ -27,17 +26,26 @@ import java.io.ByteArrayOutputStream
  * 2:3 (2in x 3in), but source images (card scans especially) aren't
  * always already in that orientation, and there's evidence the
  * printer/protocol may have its own fixed orientation expectations
- * independent of anything in the source file (the very first image
- * this whole project's protocol was reverse-engineered from was
- * itself stored sideways relative to how a person would naturally
- * view it). `rotationDegrees` lets the caller (the UI, ultimately the
- * person using the app) rotate the source before cropping, and
- * MainActivity generates its live preview using the exact same
- * function used to build what actually gets sent -- see
- * preparePreviewBitmap() -- so what you see is what prints. There is
- * currently no known-correct default rotation baked in here; it's
- * 0 (no extra rotation beyond EXIF correction) until calibrated
- * against a real test print.
+ * independent of anything in the source file. `rotationDegrees` is a
+ * coarse 90-degree-snap rotation applied to the source before any
+ * interactive framing; there is currently no known-correct default
+ * baked in here -- it's 0 until calibrated against a real test print.
+ *
+ * FRAMING MODEL (as of the interactive zoom/rotate/pan feature):
+ *   1. Load the source image, apply EXIF correction, then the coarse
+ *      `rotationDegrees` snap. This is prepareSourceBitmap()'s output.
+ *   2. Optionally pad that to exactly 2:3 first (padTo2x3), so nothing
+ *      from the source is ever lost regardless of framing choices.
+ *   3. Frame that source onto the target canvas (whatever size --
+ *      the live on-screen preview uses the view's own size, the final
+ *      print uses PREVIEW_WIDTH x PREVIEW_HEIGHT) using a TransformState
+ *      (zoom/rotate/pan). buildTransformMatrix() and bakeBitmap() do
+ *      this, and are used by BOTH the interactive view's live
+ *      rendering and the final print bake -- the same math at two
+ *      different output resolutions -- so what's on screen is what
+ *      prints. TransformState's default (zoom=1, rotation=0, pan=0,0)
+ *      exactly reproduces the old fixed "auto-crop to cover" behavior,
+ *      so that's what Reset returns to.
  */
 object ImagePrep {
 
@@ -53,6 +61,79 @@ object ImagePrep {
         val finalJpeg: ByteArray,
         val usedQuality: Int,
     )
+
+    /**
+     * The user-adjustable framing of the source image within the
+     * target canvas. zoomScale is a MULTIPLIER on top of the
+     * automatic "cover" base scale (1.0 = default cover fit, >1.0 =
+     * zoomed in further, <1.0 = zoomed out, potentially revealing
+     * fillColor background). rotationAngle is in degrees, additional
+     * to (not replacing) the coarse rotationDegrees snap.
+     * panXFraction/panYFraction shift the image as a fraction of the
+     * canvas's own width/height, so the same value reproduces the
+     * same RELATIVE framing regardless of the canvas's actual pixel
+     * size (on-screen preview vs full-resolution print).
+     */
+    data class TransformState(
+        val zoomScale: Float = 1f,
+        val rotationAngle: Float = 0f,
+        val panXFraction: Float = 0f,
+        val panYFraction: Float = 0f,
+    )
+
+    /**
+     * Builds the Matrix that maps `source`'s own pixel coordinates
+     * onto a dstW x dstH canvas, applying TransformState on top of
+     * the automatic base "cover" scale. Used identically by the live
+     * interactive preview (at the view's on-screen size) and the
+     * final print bake (at PREVIEW_WIDTH x PREVIEW_HEIGHT) -- same
+     * function, different dst size, so the framing matches exactly.
+     */
+    fun buildTransformMatrix(
+        srcWidth: Int,
+        srcHeight: Int,
+        dstWidth: Int,
+        dstHeight: Int,
+        transform: TransformState,
+    ): Matrix {
+        val baseScale = maxOf(dstWidth.toFloat() / srcWidth, dstHeight.toFloat() / srcHeight)
+        val totalScale = baseScale * transform.zoomScale
+
+        val matrix = Matrix()
+        // Move the source's own center to the origin, so scale/rotate
+        // below pivot around the image's center rather than its
+        // top-left corner.
+        matrix.postTranslate(-srcWidth / 2f, -srcHeight / 2f)
+        matrix.postScale(totalScale, totalScale)
+        matrix.postRotate(transform.rotationAngle)
+        // Move to the destination canvas's center, offset by the pan
+        // (as a fraction of the DESTINATION size, so it's resolution
+        // independent between preview and final bake).
+        val dstCenterX = dstWidth / 2f
+        val dstCenterY = dstHeight / 2f
+        matrix.postTranslate(
+            dstCenterX + transform.panXFraction * dstWidth,
+            dstCenterY + transform.panYFraction * dstHeight,
+        )
+        return matrix
+    }
+
+    /**
+     * Renders `source` onto a new dstW x dstH bitmap using the given
+     * transform, filling any area the (possibly zoomed-out/panned)
+     * source doesn't cover with fillColor. This is the shared
+     * rendering path for both the interactive view's live drawing and
+     * the final print bake.
+     */
+    fun bakeBitmap(source: Bitmap, dstWidth: Int, dstHeight: Int, transform: TransformState, fillColor: Int): Bitmap {
+        val matrix = buildTransformMatrix(source.width, source.height, dstWidth, dstHeight, transform)
+        val canvas = Bitmap.createBitmap(dstWidth, dstHeight, Bitmap.Config.ARGB_8888)
+        val c = Canvas(canvas)
+        c.drawColor(fillColor)
+        val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG or android.graphics.Paint.FILTER_BITMAP_FLAG)
+        c.drawBitmap(source, matrix, paint)
+        return canvas
+    }
 
     /**
      * Adds solid-color bars (centered) so the bitmap's dimensions
@@ -72,11 +153,9 @@ object ImagePrep {
         val newWidth: Int
         val newHeight: Int
         if (currentRatio > targetRatio) {
-            // source is wider than the target ratio -> add height (top/bottom bars)
             newWidth = width
             newHeight = Math.round(width * ratioH.toDouble() / ratioW).toInt()
         } else {
-            // source is taller than the target ratio -> add width (left/right bars)
             newHeight = height
             newWidth = Math.round(height * ratioW.toDouble() / ratioH).toInt()
         }
@@ -103,39 +182,6 @@ object ImagePrep {
         return Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
     }
 
-    /**
-     * Scales `source` to fill (autoCrop=true) or fit (autoCrop=false)
-     * a targetW x targetH box, center-cropping or center-padding as
-     * needed, mirroring Python's _crop_resize.
-     */
-    private fun cropResize(source: Bitmap, targetW: Int, targetH: Int, autoCrop: Boolean): Bitmap {
-        val width = source.width
-        val height = source.height
-
-        val scale = if (autoCrop) {
-            maxOf(targetW.toDouble() / width, targetH.toDouble() / height)
-        } else {
-            minOf(targetW.toDouble() / width, targetH.toDouble() / height)
-        }
-
-        val scaledW = Math.round(width * scale).toInt()
-        val scaledH = Math.round(height * scale).toInt()
-
-        val scaledBitmap = if (scaledW != width || scaledH != height) {
-            Bitmap.createScaledBitmap(source, scaledW, scaledH, true)
-        } else {
-            source
-        }
-
-        val canvas = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
-        val c = Canvas(canvas)
-        c.drawColor(Color.BLACK)
-        val offsetX = (targetW - scaledW) / 2
-        val offsetY = (targetH - scaledH) / 2
-        c.drawBitmap(scaledBitmap, offsetX.toFloat(), offsetY.toFloat(), null)
-        return canvas
-    }
-
     private fun encodeJpeg(bitmap: Bitmap, quality: Int): ByteArray {
         val stream = ByteArrayOutputStream()
         bitmap.compress(Bitmap.CompressFormat.JPEG, quality, stream)
@@ -154,8 +200,6 @@ object ImagePrep {
     ): Pair<Int, ByteArray> {
         val smallest = encodeJpeg(bitmap, minQuality)
         if (smallest.size > maxBytes) {
-            // Even minimum quality exceeds the limit; nothing more we can do
-            // without also shrinking pixel dimensions.
             return Pair(minQuality, smallest)
         }
 
@@ -177,70 +221,55 @@ object ImagePrep {
         return Pair(bestQ, bestBytes)
     }
 
-    private fun loadAndOrient(context: Context, uri: Uri, rotationDegrees: Int): Bitmap {
+    /**
+     * Loads the image at `uri`, applies EXIF correction and the coarse
+     * rotationDegrees snap, and optionally pads to exactly 2:3. This
+     * is the "source" bitmap the interactive preview view frames via
+     * pinch/rotate/pan -- NOT yet cropped/scaled to the print canvas.
+     */
+    fun prepareSourceBitmap(
+        context: Context,
+        uri: Uri,
+        rotationDegrees: Int = 0,
+        padTo2x3: Boolean = false,
+        padFillColor: Int = Color.WHITE,
+    ): Bitmap {
         val inputStream = context.contentResolver.openInputStream(uri)
             ?: throw IllegalArgumentException("Could not open image at $uri")
         var src = inputStream.use { android.graphics.BitmapFactory.decodeStream(it) }
             ?: throw IllegalArgumentException("Could not decode image at $uri")
 
-        // Respect EXIF orientation first (how the source file says it should
-        // be displayed), THEN apply the caller/user's chosen rotation on top.
         src = applyExifOrientation(context, uri, src)
         src = rotateBitmap(src, rotationDegrees)
+
+        if (padTo2x3) {
+            src = padToRatio(src, 2, 3, padFillColor)
+        }
         return src
     }
 
     /**
-     * Produces exactly the 1280x1920 bitmap that will be encoded and
-     * pushed to the printer as "preview" -- i.e. the actual print
-     * content, before JPEG compression. Use this to render a live,
-     * accurate preview in the UI: whatever this returns is what will
-     * print, framed exactly as it will be framed.
-     */
-    fun preparePreviewBitmap(
-        context: Context,
-        uri: Uri,
-        rotationDegrees: Int = 0,
-        autoCrop: Boolean = true,
-        padTo2x3: Boolean = false,
-        padFillColor: Int = Color.WHITE,
-    ): Bitmap {
-        var src = loadAndOrient(context, uri, rotationDegrees)
-        if (padTo2x3) {
-            src = padToRatio(src, 2, 3, padFillColor)
-        }
-        return cropResize(src, PREVIEW_WIDTH, PREVIEW_HEIGHT, autoCrop)
-    }
-
-    /**
-     * Loads an image from a content Uri (e.g. from the system image
-     * picker) and produces the two JPEG buffers the printer expects.
+     * Takes an already-prepared source bitmap (see prepareSourceBitmap)
+     * and the user's current framing (see TransformState/InteractivePreviewView)
+     * and produces the two JPEG buffers the printer expects.
      *
-     * @param rotationDegrees rotate the source by this many degrees
-     *   (0/90/180/270) before cropping -- see the class-level kdoc for
-     *   why this exists and how to calibrate it. Should match whatever
-     *   was last shown via preparePreviewBitmap() so the physical
-     *   print matches what the user confirmed on screen.
-     * @param padTo2x3 letterbox the source to exactly 2:3 before
-     *   anything else, so autoCrop can't cut into it. Use for content
-     *   with a fixed aspect ratio you don't want trimmed (card scans).
-     * @param padFillColor fill color for the padding bars, e.g.
-     *   Color.BLACK instead of the white default.
+     * @param transform the user's current zoom/rotate/pan framing,
+     *   read from the interactive preview view at print time. Its
+     *   default reproduces the old fixed "auto-crop to cover" behavior.
+     * @param padFillColor also used as the fill color for any canvas
+     *   area the framed source doesn't cover (e.g. zoomed out).
      * @param maxPreviewBytes automatically lowers JPEG quality below
      *   `quality` as needed to keep the preview under this many bytes.
      *   Pass null to disable and always use the exact quality given.
      */
     fun prepareImage(
-        context: Context,
-        uri: Uri,
-        rotationDegrees: Int = 0,
-        autoCrop: Boolean = true,
+        source: Bitmap,
+        transform: TransformState = TransformState(),
         quality: Int = 95,
-        padTo2x3: Boolean = false,
         padFillColor: Int = Color.WHITE,
         maxPreviewBytes: Int? = DEFAULT_MAX_PREVIEW_BYTES,
     ): PreparedImage {
-        val preview = preparePreviewBitmap(context, uri, rotationDegrees, autoCrop, padTo2x3, padFillColor)
+        val preview = bakeBitmap(source, PREVIEW_WIDTH, PREVIEW_HEIGHT, transform, padFillColor)
         val final = rotateBitmap(
             Bitmap.createScaledBitmap(preview, FINAL_WIDTH, FINAL_HEIGHT, true),
             180,
@@ -254,6 +283,29 @@ object ImagePrep {
         val finalBytes = encodeJpeg(final, usedQuality)
 
         return PreparedImage(previewBytes, finalBytes, usedQuality)
+    }
+
+    /**
+     * Convenience one-shot version: loads from a Uri and prepares in
+     * one call, using the default TransformState (equivalent to the
+     * old fixed auto-crop behavior). Mainly useful for testing/CLI-style
+     * use; MainActivity's normal flow uses prepareSourceBitmap() +
+     * the interactive view + this class's prepareImage(source, ...)
+     * separately, since framing needs to be interactively adjustable
+     * between those two steps.
+     */
+    fun prepareImage(
+        context: Context,
+        uri: Uri,
+        rotationDegrees: Int = 0,
+        transform: TransformState = TransformState(),
+        quality: Int = 95,
+        padTo2x3: Boolean = false,
+        padFillColor: Int = Color.WHITE,
+        maxPreviewBytes: Int? = DEFAULT_MAX_PREVIEW_BYTES,
+    ): PreparedImage {
+        val source = prepareSourceBitmap(context, uri, rotationDegrees, padTo2x3, padFillColor)
+        return prepareImage(source, transform, quality, padFillColor, maxPreviewBytes)
     }
 
     private fun applyExifOrientation(context: Context, uri: Uri, bitmap: Bitmap): Bitmap {
@@ -273,8 +325,6 @@ object ImagePrep {
             }
             rotateBitmap(bitmap, degrees)
         } catch (e: Exception) {
-            // If EXIF reading fails for any reason, just use the bitmap as-is
-            // rather than failing the whole print.
             bitmap
         }
     }

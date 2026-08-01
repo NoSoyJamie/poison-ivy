@@ -53,20 +53,58 @@
             android:textStyle="bold"
             android:layout_marginTop="24dp" />
 
-        <ImageView
-            android:id="@+id/imagePreview"
+        <FrameLayout
+            android:id="@+id/previewContainer"
             android:layout_width="match_parent"
-            android:layout_height="420dp"
+            android:layout_height="300dp"
             android:layout_marginTop="8dp"
-            android:layout_marginBottom="8dp"
-            android:scaleType="fitCenter"
-            android:background="#EEEEEE"
-            android:contentDescription="Preview of exactly what will print" />
+            android:layout_marginBottom="8dp">
+
+            <com.poisonivy.printer.InteractivePreviewView
+                android:id="@+id/imagePreview"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:background="#EEEEEE"
+                android:contentDescription="Preview of exactly what will print -- drag to pan, pinch to zoom, twist with two fingers to rotate" />
+
+            <Button
+                android:id="@+id/resetPreviewButton"
+                style="?android:attr/buttonStyleSmall"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="bottom|start"
+                android:layout_margin="6dp"
+                android:text="Reset" />
+
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="bottom|end"
+                android:layout_margin="6dp"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/undoPreviewButton"
+                    style="?android:attr/buttonStyleSmall"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Undo" />
+
+                <Button
+                    android:id="@+id/redoPreviewButton"
+                    style="?android:attr/buttonStyleSmall"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="4dp"
+                    android:text="Redo" />
+            </LinearLayout>
+
+        </FrameLayout>
 
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="This preview shows exactly the framing/rotation that will print. If it comes out wrong on paper, rotate here to match -- the app will remember your choice."
+            android:text="Drag to pan, pinch to zoom, twist with two fingers to rotate. This preview shows exactly the framing that will print."
             android:textSize="12sp"
             android:layout_marginBottom="4dp" />
 

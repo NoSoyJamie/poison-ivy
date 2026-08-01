@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
 import android.os.Build
@@ -17,7 +18,7 @@ import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
-import android.widget.ImageView
+import android.widget.FrameLayout
 import android.widget.RadioGroup
 import android.widget.TextView
 import android.widget.Toast
@@ -34,7 +35,11 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var selectedDeviceText: TextView
     private lateinit var selectDeviceButton: Button
-    private lateinit var imagePreview: ImageView
+    private lateinit var previewContainer: FrameLayout
+    private lateinit var imagePreview: InteractivePreviewView
+    private lateinit var resetPreviewButton: Button
+    private lateinit var undoPreviewButton: Button
+    private lateinit var redoPreviewButton: Button
     private lateinit var rotateButton: Button
     private lateinit var rotationLabel: TextView
     private lateinit var pickImageButton: Button
@@ -47,6 +52,20 @@ class MainActivity : AppCompatActivity() {
     private var selectedDevice: BluetoothDevice? = null
     private var selectedImageUri: Uri? = null
     private var rotationDegrees: Int = 0
+
+    // The oriented (EXIF + coarse rotationDegrees) and optionally padded
+    // bitmap that the interactive view frames via pinch/rotate/pan. This
+    // is what actually gets baked into the final print, using whatever
+    // transform the view currently holds.
+    private var sourceBitmap: Bitmap? = null
+
+    // Undo/redo history for the interactive transform: a simple list +
+    // pointer. Resets to a single default entry whenever the source
+    // bitmap changes (new image, coarse rotation, or pad option change),
+    // since those are structural changes the old fine-adjustment history
+    // doesn't meaningfully apply to anymore.
+    private val transformHistory = mutableListOf(ImagePrep.TransformState())
+    private var historyIndex = 0
 
     private var discoveryReceiver: BroadcastReceiver? = null
     private var discoveryDialog: AlertDialog? = null
@@ -77,7 +96,7 @@ class MainActivity : AppCompatActivity() {
             selectedImageUri = uri
             rotationDegrees = 0
             updateRotationLabel()
-            refreshPreview()
+            regenerateSourceBitmap()
             updatePrintButtonEnabled()
         }
     }
@@ -88,7 +107,11 @@ class MainActivity : AppCompatActivity() {
 
         selectedDeviceText = findViewById(R.id.selectedDeviceText)
         selectDeviceButton = findViewById(R.id.selectDeviceButton)
+        previewContainer = findViewById(R.id.previewContainer)
         imagePreview = findViewById(R.id.imagePreview)
+        resetPreviewButton = findViewById(R.id.resetPreviewButton)
+        undoPreviewButton = findViewById(R.id.undoPreviewButton)
+        redoPreviewButton = findViewById(R.id.redoPreviewButton)
         rotateButton = findViewById(R.id.rotateButton)
         rotationLabel = findViewById(R.id.rotationLabel)
         pickImageButton = findViewById(R.id.pickImageButton)
@@ -105,10 +128,50 @@ class MainActivity : AppCompatActivity() {
         rotateButton.setOnClickListener {
             rotationDegrees = (rotationDegrees + 90) % 360
             updateRotationLabel()
-            refreshPreview()
+            regenerateSourceBitmap()
         }
-        padCheckbox.setOnCheckedChangeListener { _, _ -> refreshPreview() }
-        padColorGroup.setOnCheckedChangeListener { _, _ -> refreshPreview() }
+        padCheckbox.setOnCheckedChangeListener { _, _ -> regenerateSourceBitmap() }
+        padColorGroup.setOnCheckedChangeListener { _, _ -> regenerateSourceBitmap() }
+
+        imagePreview.onTransformCommitted = { newState -> pushHistory(newState) }
+        resetPreviewButton.setOnClickListener {
+            imagePreview.resetTransform()
+            pushHistory(ImagePrep.TransformState())
+        }
+        undoPreviewButton.setOnClickListener { undoTransform() }
+        redoPreviewButton.setOnClickListener { redoTransform() }
+        updateHistoryButtonsEnabled()
+
+        lockPreviewContainerTo2x3()
+    }
+
+    /**
+     * Forces the preview container's shape to exactly 2:3 (width:height),
+     * matching the final print canvas's own proportions. This isn't just
+     * cosmetic: InteractivePreviewView computes its "cover" auto-scale
+     * from its own measured width/height, and the final print bake uses
+     * a fixed 1280x1920 (also 2:3) canvas -- if the on-screen container
+     * were a different aspect ratio, the same zoom/pan/rotation values
+     * would frame the image differently on screen than in the final
+     * print, breaking the "what you see is what prints" guarantee this
+     * whole preview exists for. Computed from the container's actual
+     * measured width once layout has happened, rather than an XML
+     * aspect-ratio constraint, so this is easy to verify is correct
+     * (plain arithmetic) without needing to compile-test constraint-ratio
+     * syntax.
+     */
+    private fun lockPreviewContainerTo2x3() {
+        previewContainer.post {
+            val width = previewContainer.width
+            if (width > 0) {
+                val height = width * 3 / 2 // width:height = 2:3
+                val params = previewContainer.layoutParams
+                if (params.height != height) {
+                    params.height = height
+                    previewContainer.layoutParams = params
+                }
+            }
+        }
     }
 
     private fun updateRotationLabel() {
@@ -116,13 +179,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Regenerates the preview using the EXACT same function that builds
-     * what actually gets sent to the printer (ImagePrep.preparePreviewBitmap),
-     * with the currently selected rotation/pad options. This is what makes
-     * the on-screen preview a reliable stand-in for the physical printout --
-     * if it looks right here, rotated correctly, it should print that way.
+     * Rebuilds the oriented/padded source bitmap (EXIF correction +
+     * coarse rotationDegrees + optional 2:3 padding) whenever any of
+     * those inputs change, assigns it to the interactive view (which
+     * resets its own zoom/pan/rotate transform back to default whenever
+     * the source changes -- a new source invalidates old fine-tuned
+     * framing anyway), and resets the undo/redo history to match.
      */
-    private fun refreshPreview() {
+    private fun regenerateSourceBitmap() {
         val uri = selectedImageUri ?: return
         val padTo2x3 = padCheckbox.isChecked
         val padColor = if (padColorGroup.checkedRadioButtonId == R.id.padColorBlack) Color.BLACK else Color.WHITE
@@ -131,7 +195,7 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch {
             try {
                 val bitmap = withContext(Dispatchers.IO) {
-                    ImagePrep.preparePreviewBitmap(
+                    ImagePrep.prepareSourceBitmap(
                         context = this@MainActivity,
                         uri = uri,
                         rotationDegrees = rotation,
@@ -139,11 +203,50 @@ class MainActivity : AppCompatActivity() {
                         padFillColor = padColor,
                     )
                 }
-                imagePreview.setImageBitmap(bitmap)
+                sourceBitmap = bitmap
+                imagePreview.backgroundFillColor = padColor
+                imagePreview.sourceBitmap = bitmap // resets the view's own transform to default
+                transformHistory.clear()
+                transformHistory.add(ImagePrep.TransformState())
+                historyIndex = 0
+                updateHistoryButtonsEnabled()
             } catch (e: Exception) {
-                log("Could not generate preview: ${e.message}")
+                log("Could not load image: ${e.message}")
             }
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Undo / redo history for the interactive transform
+    // ---------------------------------------------------------------
+
+    private fun pushHistory(state: ImagePrep.TransformState) {
+        // Discard any "redo" entries beyond the current point, then append.
+        while (transformHistory.size > historyIndex + 1) {
+            transformHistory.removeAt(transformHistory.size - 1)
+        }
+        transformHistory.add(state)
+        historyIndex = transformHistory.size - 1
+        updateHistoryButtonsEnabled()
+    }
+
+    private fun undoTransform() {
+        if (historyIndex <= 0) return
+        historyIndex--
+        imagePreview.transform = transformHistory[historyIndex]
+        updateHistoryButtonsEnabled()
+    }
+
+    private fun redoTransform() {
+        if (historyIndex >= transformHistory.size - 1) return
+        historyIndex++
+        imagePreview.transform = transformHistory[historyIndex]
+        updateHistoryButtonsEnabled()
+    }
+
+    private fun updateHistoryButtonsEnabled() {
+        undoPreviewButton.isEnabled = historyIndex > 0
+        redoPreviewButton.isEnabled = historyIndex < transformHistory.size - 1
     }
 
     // ---------------------------------------------------------------
@@ -281,12 +384,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun startPrint() {
         val device = selectedDevice ?: return
-        val uri = selectedImageUri ?: return
-
-        val padTo2x3 = padCheckbox.isChecked
+        val source = sourceBitmap ?: return
+        val transform = imagePreview.transform
         val padColor = if (padColorGroup.checkedRadioButtonId == R.id.padColorBlack) Color.BLACK else Color.WHITE
         val maxSize = maxSizeInput.text.toString().toIntOrNull() ?: ImagePrep.DEFAULT_MAX_PREVIEW_BYTES
-        val rotation = rotationDegrees
 
         printButton.isEnabled = false
         statusLog.text = ""
@@ -296,10 +397,8 @@ class MainActivity : AppCompatActivity() {
                 log("Preparing image...")
                 val prepared = withContext(Dispatchers.IO) {
                     ImagePrep.prepareImage(
-                        context = this@MainActivity,
-                        uri = uri,
-                        rotationDegrees = rotation,
-                        padTo2x3 = padTo2x3,
+                        source = source,
+                        transform = transform,
                         padFillColor = padColor,
                         maxPreviewBytes = maxSize,
                     )
