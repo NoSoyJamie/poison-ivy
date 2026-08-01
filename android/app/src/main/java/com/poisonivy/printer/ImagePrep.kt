@@ -120,56 +120,68 @@ object ImagePrep {
 
     /**
      * Returns a new TransformState with zoomScale/rotationAngle changed
-     * to newZoom/newRotation, with pan adjusted so that whatever image
-     * content currently appears at screen point (focusX, focusY) STAYS
-     * at that same screen point after the change. This is what makes
-     * pinch-zoom and two-finger rotate pivot around where your fingers
-     * actually are, instead of always around the image's fixed center.
+     * to newZoom/newRotation, with pan solved so that whatever image
+     * content was at screen point (referenceFocusX, referenceFocusY)
+     * under referenceTransform ends up at screen point (newFocusX,
+     * newFocusY) after the change.
      *
-     * Works by inverting the CURRENT (pre-change) matrix to find which
-     * image-space point is under the focus right now, then solving for
-     * the pan that puts that same point back under the focus after the
-     * zoom/rotation change -- using Android's own Matrix invert/mapPoints
-     * for the actual math, rather than a hand-derived formula, since
-     * that's easier to verify is correct without being able to run it.
+     * This is deliberately more general than "zoom around a fixed
+     * point": referenceFocusX/Y and newFocusX/Y can be DIFFERENT
+     * points, which is exactly what a real two-finger gesture needs --
+     * as the touch midpoint itself moves between frames (not just the
+     * distance/angle between the two fingers), pan naturally falls out
+     * of this same calculation instead of needing separate handling.
+     * Passing the same value for both reference and new focus is just
+     * the special case of "pivot around a point that isn't moving".
+     *
+     * Works by inverting referenceTransform's matrix to find which
+     * image-space point was under the reference focus, then solving
+     * for the pan that puts that same point under the new focus after
+     * the zoom/rotation change -- using Android's own Matrix
+     * invert/mapPoints for the actual math, rather than a hand-derived
+     * formula, since that's easier to verify is correct without being
+     * able to run it.
      */
     fun pivotTransform(
-        current: TransformState,
+        referenceTransform: TransformState,
+        referenceFocusX: Float,
+        referenceFocusY: Float,
         newZoom: Float,
         newRotation: Float,
-        focusX: Float,
-        focusY: Float,
+        newFocusX: Float,
+        newFocusY: Float,
         srcWidth: Int,
         srcHeight: Int,
         dstWidth: Int,
         dstHeight: Int,
     ): TransformState {
-        val oldMatrix = buildTransformMatrix(srcWidth, srcHeight, dstWidth, dstHeight, current)
+        val refMatrix = buildTransformMatrix(srcWidth, srcHeight, dstWidth, dstHeight, referenceTransform)
         val inverse = Matrix()
-        if (!oldMatrix.invert(inverse)) {
+        if (!refMatrix.invert(inverse)) {
             // Degenerate matrix (shouldn't normally happen) -- apply the
             // change without a pivot adjustment rather than crash.
-            return current.copy(zoomScale = newZoom, rotationAngle = newRotation)
+            return referenceTransform.copy(zoomScale = newZoom, rotationAngle = newRotation)
         }
-        val focusInImageSpace = floatArrayOf(focusX, focusY)
-        inverse.mapPoints(focusInImageSpace)
+        val imagePoint = floatArrayOf(referenceFocusX, referenceFocusY)
+        inverse.mapPoints(imagePoint)
 
         // See where that same image-space point lands with the NEW
         // zoom/rotation but zero pan, then the gap between that and the
-        // original focus point is exactly the pan needed to close it.
+        // NEW focus point is exactly the pan needed to close it.
         val noPan = TransformState(zoomScale = newZoom, rotationAngle = newRotation)
         val noPanMatrix = buildTransformMatrix(srcWidth, srcHeight, dstWidth, dstHeight, noPan)
-        val mapped = floatArrayOf(focusInImageSpace[0], focusInImageSpace[1])
+        val mapped = floatArrayOf(imagePoint[0], imagePoint[1])
         noPanMatrix.mapPoints(mapped)
 
-        val panPxX = focusX - mapped[0]
-        val panPxY = focusY - mapped[1]
+        val panPxX = newFocusX - mapped[0]
+        val panPxY = newFocusY - mapped[1]
 
         return TransformState(
             zoomScale = newZoom,
             rotationAngle = newRotation,
             panXFraction = panPxX / dstWidth,
             panYFraction = panPxY / dstHeight,
+
         )
     }
 

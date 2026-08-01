@@ -8,31 +8,44 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.util.AttributeSet
 import android.view.MotionEvent
-import android.view.ScaleGestureDetector
 import android.view.View
 
 /**
  * Shows the print source image and lets the user frame it with
- * standard touch gestures:
- *   - one finger drag = pan
- *   - two-finger pinch = zoom, pivoting around the pinch midpoint
- *   - two-finger twist = rotate, pivoting around the twist midpoint
+ * two-finger touch gestures -- pinch to zoom, twist to rotate, and
+ * drag the pair of fingers to pan, ALL from the same continuous
+ * two-finger motion (not separate gestures you have to do one at a
+ * time). Single-finger touches are deliberately left un-acted-on (no
+ * pan, no requestDisallowInterceptTouchEvent claim) so the enclosing
+ * ScrollView is still free to intercept and scroll normally with one
+ * finger, including when this preview fills most or all of the
+ * visible screen.
  *
  * The current framing is exposed as `transform` (see
  * ImagePrep.TransformState) and rendered using
  * ImagePrep.buildTransformMatrix() -- the EXACT same function used to
  * bake the final print bitmap at print time, just targeting this
  * view's own on-screen size instead of the print canvas's, so what's
- * shown here is a faithful preview of what will print. Zoom/rotate
- * pivot around the gesture's focus point (see ImagePrep.pivotTransform)
- * rather than the image's fixed center, matching how pinch gestures
- * normally feel.
+ * shown here is a faithful preview of what will print.
  *
- * Also explicitly disables the enclosing ScrollView's touch
- * interception for the duration of a gesture (see
- * requestDisallowInterceptTouchEvent in onTouchEvent) -- without that,
- * any vertical finger movement gets claimed by the ScrollView for its
- * own scrolling instead of reaching this view.
+ * HOW THE COMBINED GESTURE WORKS: rather than combining Android's
+ * ScaleGestureDetector (for zoom) with separate hand-rolled rotation
+ * tracking -- two independent systems that only loosely cooperate,
+ * which is what made an earlier version of this feel stiff / like
+ * only one of zoom-or-rotate worked at a time -- this computes zoom,
+ * rotation, AND pan together from the same two raw pointer positions
+ * every frame:
+ *   1. When a second finger touches down, capture a "reference":
+ *      the current transform, plus the current two-finger distance,
+ *      angle, and midpoint.
+ *   2. On every subsequent move (while still 2 fingers down), compare
+ *      the CURRENT distance/angle/midpoint against that reference to
+ *      get a scale factor and rotation delta, and use
+ *      ImagePrep.pivotTransform to solve for the pan that keeps
+ *      whatever was under the reference midpoint anchored under the
+ *      CURRENT midpoint -- which naturally produces panning too, as
+ *      an emergent property of the midpoint itself moving, with no
+ *      separate pan-tracking code needed.
  *
  * This view does not manage undo/redo or a reset button itself --
  * MainActivity owns that (see its transform history stack), calling
@@ -49,9 +62,10 @@ import android.view.View
  * Matrix invert/mapPoints rather than hand-derived formulas, but the
  * gesture bookkeeping below (tracking pointers across finger-count
  * transitions) is the kind of code that most benefits from real
- * on-device testing/tuning. If gestures feel janky or jump
- * unexpectedly when adding/removing a second finger, that's the most
- * likely place to look first.
+ * on-device testing/tuning. If gestures feel janky or jump when a
+ * third finger touches down (an edge case this doesn't specially
+ * handle -- it just re-baselines against whichever two pointers
+ * happen to be at index 0/1), that's the most likely place to look.
  */
 class InteractivePreviewView @JvmOverloads constructor(
     context: Context,
@@ -85,102 +99,126 @@ class InteractivePreviewView @JvmOverloads constructor(
     }
 
     private var transformAtGestureStart = transform
-    private var dragLastX = 0f
-    private var dragLastY = 0f
-    private var rotateLastAngle = 0f
+
+    // Two-finger gesture reference, captured fresh whenever the pointer
+    // set changes while 2+ fingers are down.
+    private var refTransform = ImagePrep.TransformState()
+    private var refFocusX = 0f
+    private var refFocusY = 0f
+    private var refDistance = 1f
+    private var refAngle = 0f
+    private var twoFingerGestureActive = false
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
 
-    private val scaleGestureDetector = ScaleGestureDetector(
-        context,
-        object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
-            override fun onScale(detector: ScaleGestureDetector): Boolean {
-                val bmp = sourceBitmap ?: return true
-                if (width <= 0 || height <= 0) return true
-                val newZoom = (transform.zoomScale * detector.scaleFactor).coerceIn(0.3f, 6f)
-                transform = ImagePrep.pivotTransform(
-                    transform, newZoom, transform.rotationAngle,
-                    detector.focusX, detector.focusY,
-                    bmp.width, bmp.height, width, height,
-                )
-                return true
-            }
-        }
-    )
-
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        scaleGestureDetector.onTouchEvent(event)
-
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                // Claim the gesture from the enclosing ScrollView immediately.
-                // Without this, any vertical finger movement gets interpreted
-                // by the ScrollView as "the user wants to scroll the page"
-                // and it steals all subsequent move events, which is exactly
-                // what caused pan/zoom/rotate to stop mid-gesture.
-                parent?.requestDisallowInterceptTouchEvent(true)
+                // Deliberately do NOT claim the gesture yet, and do
+                // nothing else here -- a single finger touching down
+                // should be free to become a normal ScrollView scroll.
+                // We only start actually doing anything once a second
+                // finger arrives, below.
                 transformAtGestureStart = transform
-                resetGestureReferences(event)
             }
-            MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_POINTER_UP -> {
-                // Finger count just changed -- re-baseline our reference
-                // points against the current pointer set rather than
-                // trying to precisely track which index is which finger
-                // across the transition. Causes at most a one-frame
-                // "no-op" reset, not a visible jump, since we're only
-                // updating the REFERENCE, not the transform itself.
-                resetGestureReferences(event)
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                if (event.pointerCount >= 2) {
+                    // Now we're doing real two-finger manipulation --
+                    // claim the gesture from the ScrollView from this
+                    // point forward.
+                    parent?.requestDisallowInterceptTouchEvent(true)
+                    twoFingerGestureActive = true
+                    captureTwoFingerReference(event)
+                }
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                val remaining = event.pointerCount - 1
+                if (remaining >= 2) {
+                    // Still 2+ fingers after this one lifts -- re-baseline
+                    // against whichever pointers remain.
+                    captureTwoFingerReference(event)
+                } else {
+                    // Dropping below 2 fingers ends two-finger manipulation.
+                    // Release the ScrollView claim so a single remaining
+                    // finger can scroll normally again.
+                    twoFingerGestureActive = false
+                    parent?.requestDisallowInterceptTouchEvent(false)
+                }
             }
             MotionEvent.ACTION_MOVE -> {
                 val bmp = sourceBitmap
-                if (bmp != null && width > 0 && height > 0) {
-                    if (event.pointerCount >= 2) {
-                        val midX = (event.getX(0) + event.getX(1)) / 2f
-                        val midY = (event.getY(0) + event.getY(1)) / 2f
-                        val newAngle = angleBetweenPointers(event)
-                        var delta = newAngle - rotateLastAngle
-                        if (delta > 180f) delta -= 360f
-                        if (delta < -180f) delta += 360f
-                        // Pivot around the finger midpoint, same idea as the
-                        // zoom pivot above, so rotation feels anchored to
-                        // where your fingers are rather than always swinging
-                        // around the image's fixed center.
-                        transform = ImagePrep.pivotTransform(
-                            transform, transform.zoomScale, transform.rotationAngle + delta,
-                            midX, midY, bmp.width, bmp.height, width, height,
-                        )
-                        rotateLastAngle = newAngle
-                    } else if (event.pointerCount == 1) {
-                        val dx = event.getX(0) - dragLastX
-                        val dy = event.getY(0) - dragLastY
-                        transform = transform.copy(
-                            panXFraction = transform.panXFraction + dx / width,
-                            panYFraction = transform.panYFraction + dy / height,
-                        )
-                        dragLastX = event.getX(0)
-                        dragLastY = event.getY(0)
-                    }
+                if (twoFingerGestureActive && bmp != null && event.pointerCount >= 2 &&
+                    width > 0 && height > 0
+                ) {
+                    val curDistance = distanceBetweenPointers(event).coerceAtLeast(1f)
+                    val curAngle = angleBetweenPointers(event)
+                    val curFocusX = (event.getX(0) + event.getX(1)) / 2f
+                    val curFocusY = (event.getY(0) + event.getY(1)) / 2f
+
+                    val scaleFactor = curDistance / refDistance
+                    val newZoom = (refTransform.zoomScale * scaleFactor).coerceIn(0.3f, 6f)
+
+                    var angleDelta = curAngle - refAngle
+                    if (angleDelta > 180f) angleDelta -= 360f
+                    if (angleDelta < -180f) angleDelta += 360f
+                    val newRotation = refTransform.rotationAngle + angleDelta
+
+                    // Solving for pan against the REFERENCE focus/transform
+                    // (captured once, at gesture/transition start) rather
+                    // than the previous frame's transform is what lets
+                    // zoom + rotate + the midpoint moving (pan) all resolve
+                    // correctly together in one calculation.
+                    transform = ImagePrep.pivotTransform(
+                        referenceTransform = refTransform,
+                        referenceFocusX = refFocusX,
+                        referenceFocusY = refFocusY,
+                        newZoom = newZoom,
+                        newRotation = newRotation,
+                        newFocusX = curFocusX,
+                        newFocusY = curFocusY,
+                        srcWidth = bmp.width,
+                        srcHeight = bmp.height,
+                        dstWidth = width,
+                        dstHeight = height,
+                    )
                 }
+                // Single-finger moves are intentionally ignored here -- with
+                // requestDisallowInterceptTouchEvent never having been
+                // called for a single-finger touch, those events reach the
+                // ScrollView too and it handles its own scrolling normally.
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                twoFingerGestureActive = false
                 parent?.requestDisallowInterceptTouchEvent(false)
                 if (transform != transformAtGestureStart) {
                     onTransformCommitted?.invoke(transform)
                 }
             }
         }
+        // Always return true (claim the event) so this view keeps
+        // receiving the REST of the touch sequence -- Android stops
+        // delivering later events (like the second finger arriving) to
+        // a view that returned false on ACTION_DOWN, which would have
+        // silently broken two-finger detection entirely. Whether the
+        // parent ScrollView ALSO gets to intercept and scroll is
+        // controlled entirely by requestDisallowInterceptTouchEvent
+        // above, not by this return value.
         return true
     }
 
-    private fun resetGestureReferences(event: MotionEvent) {
-        if (event.pointerCount >= 1) {
-            dragLastX = event.getX(0)
-            dragLastY = event.getY(0)
-        }
-        if (event.pointerCount >= 2) {
-            rotateLastAngle = angleBetweenPointers(event)
-        }
+    private fun captureTwoFingerReference(event: MotionEvent) {
+        refTransform = transform
+        refFocusX = (event.getX(0) + event.getX(1)) / 2f
+        refFocusY = (event.getY(0) + event.getY(1)) / 2f
+        refDistance = distanceBetweenPointers(event).coerceAtLeast(1f)
+        refAngle = angleBetweenPointers(event)
+    }
+
+    private fun distanceBetweenPointers(event: MotionEvent): Float {
+        val dx = event.getX(1) - event.getX(0)
+        val dy = event.getY(1) - event.getY(0)
+        return Math.sqrt((dx * dx + dy * dy).toDouble()).toFloat()
     }
 
     private fun angleBetweenPointers(event: MotionEvent): Float {
