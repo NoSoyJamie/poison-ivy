@@ -103,6 +103,21 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
+            android:text="Layers (front to back)"
+            android:textStyle="bold"
+            android:layout_marginTop="8dp" />
+
+        <LinearLayout
+            android:id="@+id/layerListContainer"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:layout_marginTop="4dp"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
             android:text="Tap an image to select it (highlighted in green); tap the small button on its corner to delete it. Two-finger drag/pinch/twist moves, scales, and rotates the selected image together. This preview shows exactly what will print."
             android:textSize="12sp"
             android:layout_marginBottom="4dp" />

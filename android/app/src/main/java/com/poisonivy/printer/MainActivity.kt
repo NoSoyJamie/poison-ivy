@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
 import android.os.Build
@@ -18,6 +19,7 @@ import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
@@ -45,12 +47,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var pickImageButton: Button
     private lateinit var backgroundColorButton: Button
     private lateinit var backgroundColorSwatch: View
+    private lateinit var layerListContainer: LinearLayout
     private lateinit var maxSizeInput: EditText
     private lateinit var printButton: Button
     private lateinit var statusLog: TextView
 
     private var selectedDevice: BluetoothDevice? = null
     private var nextImageId = 0L
+
+    // Small preview bitmaps for the layer list, keyed by PlacedImage.id
+    // so they survive reordering (only rebuilt when an id we haven't
+    // seen before shows up, or dropped once its id no longer exists).
+    private val thumbnailCache = mutableMapOf<Long, Bitmap>()
 
     // Undo/redo history for the whole image layout: a simple list of
     // full-list snapshots plus a pointer, same pattern as the old
@@ -105,6 +113,7 @@ class MainActivity : AppCompatActivity() {
         pickImageButton = findViewById(R.id.pickImageButton)
         backgroundColorButton = findViewById(R.id.backgroundColorButton)
         backgroundColorSwatch = findViewById(R.id.backgroundColorSwatch)
+        layerListContainer = findViewById(R.id.layerListContainer)
         maxSizeInput = findViewById(R.id.maxSizeInput)
         printButton = findViewById(R.id.printButton)
         statusLog = findViewById(R.id.statusLog)
@@ -125,6 +134,7 @@ class MainActivity : AppCompatActivity() {
 
         updateHistoryButtonsEnabled()
         updateSelectionUi(null)
+        rebuildLayerList()
         lockPreviewContainerTo2x3()
     }
 
@@ -193,6 +203,7 @@ class MainActivity : AppCompatActivity() {
             rotateButton.isEnabled = false
             resetPreviewButton.isEnabled = false
         }
+        rebuildLayerList()
     }
 
     private fun showBackgroundColorPicker() {
@@ -268,6 +279,7 @@ class MainActivity : AppCompatActivity() {
         layoutHistory.add(images)
         historyIndex = layoutHistory.size - 1
         updateHistoryButtonsEnabled()
+        rebuildLayerList()
     }
 
     private fun undoLayout() {
@@ -291,11 +303,126 @@ class MainActivity : AppCompatActivity() {
             updateSelectionUi(imagePreview.selectedImageId)
         }
         updateHistoryButtonsEnabled()
+        rebuildLayerList()
     }
 
     private fun updateHistoryButtonsEnabled() {
         undoPreviewButton.isEnabled = historyIndex > 0
         redoPreviewButton.isEnabled = historyIndex < layoutHistory.size - 1
+    }
+
+    // ---------------------------------------------------------------
+    // Layer list -- lets the user reorder which images draw on top of
+    // which. Deliberately built with plain up/down buttons rather than
+    // drag-and-drop reordering (which would mean another hand-rolled
+    // touch gesture on top of everything already in
+    // InteractivePreviewView) -- a couple of taps per move is a fine
+    // trade for something whose correctness I can verify by inspection
+    // (simple list index swaps) without a device to test on.
+    // ---------------------------------------------------------------
+
+    /**
+     * Rebuilds the layer list UI to match imagePreview.placedImages.
+     * Called any time that list's CONTENTS or ORDER change (via
+     * pushHistory/applyHistoryState) and any time the SELECTION changes
+     * (via updateSelectionUi), so the highlighted row always matches
+     * what's selected on the canvas. Displayed front-to-back (top of
+     * the on-screen list = last in placedImages = drawn on top).
+     */
+    private fun rebuildLayerList() {
+        val images = imagePreview.placedImages
+        val validIds = images.map { it.id }.toSet()
+        thumbnailCache.keys.retainAll(validIds)
+
+        layerListContainer.removeAllViews()
+        val density = resources.displayMetrics.density
+        val thumbSize = (40 * density).toInt()
+        val rowPad = (6 * density).toInt()
+
+        // Front-to-back on screen: last-drawn (frontmost) image first.
+        for (image in images.asReversed()) {
+            val actualIndex = images.indexOfFirst { it.id == image.id }
+            val isFrontmost = actualIndex == images.size - 1
+            val isBackmost = actualIndex == 0
+            val isSelected = image.id == imagePreview.selectedImageId
+
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = android.view.Gravity.CENTER_VERTICAL
+                setPadding(rowPad, rowPad, rowPad, rowPad)
+                setBackgroundColor(if (isSelected) Color.parseColor("#33666666") else Color.TRANSPARENT)
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                )
+                setOnClickListener { imagePreview.selectImage(image.id) }
+            }
+
+            val thumb = ImageView(this).apply {
+                layoutParams = LinearLayout.LayoutParams(thumbSize, thumbSize)
+                setImageBitmap(getOrCreateThumbnail(image, thumbSize))
+                scaleType = ImageView.ScaleType.CENTER_CROP
+            }
+            row.addView(thumb)
+
+            val label = TextView(this).apply {
+                text = if (isFrontmost) "Front" else if (isBackmost) "Back" else "Layer ${actualIndex + 1}"
+                setPadding((8 * density).toInt(), 0, (8 * density).toInt(), 0)
+                layoutParams = LinearLayout.LayoutParams(
+                    0,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    1f,
+                )
+            }
+            row.addView(label)
+
+            val upButton = Button(this, null, android.R.attr.buttonStyleSmall).apply {
+                text = "▲"
+                contentDescription = "Move layer toward front"
+                isEnabled = !isFrontmost
+                setOnClickListener { moveLayer(image.id, towardFront = true) }
+            }
+            row.addView(upButton)
+
+            val downButton = Button(this, null, android.R.attr.buttonStyleSmall).apply {
+                text = "▼"
+                contentDescription = "Move layer toward back"
+                isEnabled = !isBackmost
+                setOnClickListener { moveLayer(image.id, towardFront = false) }
+            }
+            row.addView(downButton)
+
+            layerListContainer.addView(row)
+        }
+    }
+
+    private fun getOrCreateThumbnail(image: ImagePrep.PlacedImage, sizePx: Int): Bitmap {
+        thumbnailCache[image.id]?.let { return it }
+        val thumb = Bitmap.createScaledBitmap(image.bitmap, sizePx, sizePx, true)
+        thumbnailCache[image.id] = thumb
+        return thumb
+    }
+
+    /**
+     * Moves the image with this id one position toward the front
+     * (drawn later, on top) or back (drawn earlier, underneath) by
+     * swapping it with its neighbor in placedImages. A no-op if it's
+     * already at that end. Committed as a normal undo-history entry,
+     * same as any other layout change.
+     */
+    private fun moveLayer(id: Long, towardFront: Boolean) {
+        val images = imagePreview.placedImages.toMutableList()
+        val index = images.indexOfFirst { it.id == id }
+        if (index == -1) return
+        val swapWith = if (towardFront) index + 1 else index - 1
+        if (swapWith < 0 || swapWith >= images.size) return
+
+        val tmp = images[index]
+        images[index] = images[swapWith]
+        images[swapWith] = tmp
+
+        imagePreview.placedImages = images
+        pushHistory(images)
     }
 
     // ---------------------------------------------------------------

@@ -25,17 +25,27 @@ RFCOMM channels on this printer (see below).
   2:3 canvas -- tap an image to select it (highlighted in green), tap
   the small button on its corner to delete it, and use a two-finger
   gesture (drag/pinch/twist) to move, scale, and rotate the selected
-  image, all from one continuous motion.
+  image, all from one continuous motion. Press and hold an image to
+  reposition it with one finger instead (no scale/rotate change) --
+  this only claims the touch once the hold is actually recognized, so
+  it never interferes with normal one-finger scrolling.
+- **Layer list** below Undo/Redo/Reset: a small thumbnail per image
+  with up/down buttons to change which one draws on top of which
+  (deliberately plain buttons rather than drag-and-drop, to avoid
+  piling more hand-rolled touch gesture code on top of what's already
+  in `InteractivePreviewView`). Tapping a row also selects that image.
+  Reordering is a normal undo-able action, same as any other layout
+  change.
 - The preview renders using the exact same functions used to build
   what actually gets sent to the printer (`ImagePrep.buildPlacedImageMatrix`
   / `bakeComposite`), at the same 2:3 proportions as the real print --
   what you see is what prints, including every image's individual
-  placement.
+  placement and layer order.
 - A "Rotate selected 90°" button for a quick, precise coarse snap on
   top of the interactive fine rotation, and a "Reset" button that
   returns just the selected image to its default centered placement.
-  Undo/redo cover the whole layout (add, delete, move/scale/rotate),
-  not just one image at a time.
+  Undo/redo cover the whole layout (add, delete, move/scale/rotate,
+  reorder), not just one image at a time.
 - Background color is a full picker (RGB sliders + live swatch), not
   just black/white.
 - Max output size in bytes, still defaulting to 400,000 (the Python
