@@ -3,14 +3,16 @@ package com.poisonivy.printer
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
-import android.graphics.Color
 import android.graphics.Matrix
+import android.graphics.Paint
 import android.net.Uri
 import java.io.ByteArrayOutputStream
 
 /**
- * Port of poison_ivy/image_prep.py, extended with interactive
- * pinch-zoom/rotate/pan framing (see InteractivePreviewView).
+ * Port of poison_ivy/image_prep.py, extended into a multi-image
+ * "sticker sheet" compositor: any number of independently placed,
+ * scaled, and rotated images on one shared canvas, rather than a
+ * single image filling the whole sheet.
  *
  * See the Python project's PROTOCOL.md for the full story on why
  * output SIZE matters here, not just correctness: channel 2's
@@ -22,30 +24,15 @@ import java.io.ByteArrayOutputStream
  * bytes and confirmed failing at 432,500 bytes. DEFAULT_MAX_PREVIEW_BYTES
  * below matches the Python project's bracketed-and-tested default.
  *
- * On rotation/orientation: the printed sheet is always physically
- * 2:3 (2in x 3in), but source images (card scans especially) aren't
- * always already in that orientation, and there's evidence the
- * printer/protocol may have its own fixed orientation expectations
- * independent of anything in the source file. `rotationDegrees` is a
- * coarse 90-degree-snap rotation applied to the source before any
- * interactive framing; there is currently no known-correct default
- * baked in here -- it's 0 until calibrated against a real test print.
- *
- * FRAMING MODEL (as of the interactive zoom/rotate/pan feature):
- *   1. Load the source image, apply EXIF correction, then the coarse
- *      `rotationDegrees` snap. This is prepareSourceBitmap()'s output.
- *   2. Optionally pad that to exactly 2:3 first (padTo2x3), so nothing
- *      from the source is ever lost regardless of framing choices.
- *   3. Frame that source onto the target canvas (whatever size --
- *      the live on-screen preview uses the view's own size, the final
- *      print uses PREVIEW_WIDTH x PREVIEW_HEIGHT) using a TransformState
- *      (zoom/rotate/pan). buildTransformMatrix() and bakeBitmap() do
- *      this, and are used by BOTH the interactive view's live
- *      rendering and the final print bake -- the same math at two
- *      different output resolutions -- so what's on screen is what
- *      prints. TransformState's default (zoom=1, rotation=0, pan=0,0)
- *      exactly reproduces the old fixed "auto-crop to cover" behavior,
- *      so that's what Reset returns to.
+ * LAYOUT MODEL: each PlacedImage carries its own position (as a
+ * fraction of canvas width/height, so it's resolution independent
+ * between the live preview and the full-resolution final print),
+ * scale (relative to a sensible auto-fit default size, NOT relative
+ * to "cover the whole canvas" like the old single-image model), and
+ * rotation. buildPlacedImageMatrix()/bakeComposite() are used
+ * identically by the live interactive view (at its own on-screen
+ * size) and the final print bake (at PREVIEW_WIDTH x PREVIEW_HEIGHT),
+ * so on-screen framing always matches what prints.
  */
 object ImagePrep {
 
@@ -56,6 +43,10 @@ object ImagePrep {
 
     const val DEFAULT_MAX_PREVIEW_BYTES = 400_000
 
+    // New images default to filling this fraction of the canvas's
+    // shorter dimension along their own longer axis, at scale = 1.0.
+    private const val DEFAULT_FIT_FRACTION = 0.4f
+
     data class PreparedImage(
         val previewJpeg: ByteArray,
         val finalJpeg: ByteArray,
@@ -63,183 +54,165 @@ object ImagePrep {
     )
 
     /**
-     * The user-adjustable framing of the source image within the
-     * target canvas. zoomScale is a MULTIPLIER on top of the
-     * automatic "cover" base scale (1.0 = default cover fit, >1.0 =
-     * zoomed in further, <1.0 = zoomed out, potentially revealing
-     * fillColor background). rotationAngle is in degrees, additional
-     * to (not replacing) the coarse rotationDegrees snap.
-     * panXFraction/panYFraction shift the image as a fraction of the
-     * canvas's own width/height, so the same value reproduces the
-     * same RELATIVE framing regardless of the canvas's actual pixel
-     * size (on-screen preview vs full-resolution print).
+     * One image placed on the shared canvas. `bitmap` is the
+     * EXIF-corrected source (see loadOrientedBitmap) -- not yet scaled
+     * or cropped to anything. `id` is a stable identity for
+     * selection/deletion/undo bookkeeping, independent of list order.
      */
-    data class TransformState(
-        val zoomScale: Float = 1f,
+    data class PlacedImage(
+        val id: Long,
+        val bitmap: Bitmap,
+        val centerXFraction: Float = 0.5f,
+        val centerYFraction: Float = 0.5f,
+        val scale: Float = 1f,
         val rotationAngle: Float = 0f,
-        val panXFraction: Float = 0f,
-        val panYFraction: Float = 0f,
     )
 
     /**
-     * Builds the Matrix that maps `source`'s own pixel coordinates
-     * onto a dstW x dstH canvas, applying TransformState on top of
-     * the automatic base "cover" scale. Used identically by the live
-     * interactive preview (at the view's on-screen size) and the
-     * final print bake (at PREVIEW_WIDTH x PREVIEW_HEIGHT) -- same
-     * function, different dst size, so the framing matches exactly.
+     * Builds the Matrix mapping `image`'s bitmap's own pixel
+     * coordinates onto a dstW x dstH canvas. scale=1.0 corresponds to
+     * a default auto-fit size (DEFAULT_FIT_FRACTION of the canvas's
+     * shorter dimension along the image's longer axis), NOT to
+     * "cover the whole canvas" -- that's the key difference from the
+     * old single-image model, since a sticker sheet's images are
+     * usually meant to start small, not fill the page.
      */
-    fun buildTransformMatrix(
-        srcWidth: Int,
-        srcHeight: Int,
-        dstWidth: Int,
-        dstHeight: Int,
-        transform: TransformState,
-    ): Matrix {
-        val baseScale = maxOf(dstWidth.toFloat() / srcWidth, dstHeight.toFloat() / srcHeight)
-        val totalScale = baseScale * transform.zoomScale
+    fun buildPlacedImageMatrix(image: PlacedImage, dstWidth: Int, dstHeight: Int): Matrix {
+        val srcW = image.bitmap.width
+        val srcH = image.bitmap.height
+        val defaultFitScale = (DEFAULT_FIT_FRACTION * minOf(dstWidth, dstHeight)) / maxOf(srcW, srcH)
+        val totalScale = defaultFitScale * image.scale
 
         val matrix = Matrix()
-        // Move the source's own center to the origin, so scale/rotate
-        // below pivot around the image's center rather than its
-        // top-left corner.
-        matrix.postTranslate(-srcWidth / 2f, -srcHeight / 2f)
+        matrix.postTranslate(-srcW / 2f, -srcH / 2f)
         matrix.postScale(totalScale, totalScale)
-        matrix.postRotate(transform.rotationAngle)
-        // Move to the destination canvas's center, offset by the pan
-        // (as a fraction of the DESTINATION size, so it's resolution
-        // independent between preview and final bake).
-        val dstCenterX = dstWidth / 2f
-        val dstCenterY = dstHeight / 2f
-        matrix.postTranslate(
-            dstCenterX + transform.panXFraction * dstWidth,
-            dstCenterY + transform.panYFraction * dstHeight,
-        )
+        matrix.postRotate(image.rotationAngle)
+        matrix.postTranslate(image.centerXFraction * dstWidth, image.centerYFraction * dstHeight)
         return matrix
     }
 
     /**
-     * Returns a new TransformState with zoomScale/rotationAngle changed
-     * to newZoom/newRotation, with pan solved so that whatever image
-     * content was at screen point (referenceFocusX, referenceFocusY)
-     * under referenceTransform ends up at screen point (newFocusX,
-     * newFocusY) after the change.
-     *
-     * This is deliberately more general than "zoom around a fixed
-     * point": referenceFocusX/Y and newFocusX/Y can be DIFFERENT
-     * points, which is exactly what a real two-finger gesture needs --
-     * as the touch midpoint itself moves between frames (not just the
-     * distance/angle between the two fingers), pan naturally falls out
-     * of this same calculation instead of needing separate handling.
-     * Passing the same value for both reference and new focus is just
-     * the special case of "pivot around a point that isn't moving".
-     *
-     * Works by inverting referenceTransform's matrix to find which
-     * image-space point was under the reference focus, then solving
-     * for the pan that puts that same point under the new focus after
-     * the zoom/rotation change -- using Android's own Matrix
-     * invert/mapPoints for the actual math, rather than a hand-derived
-     * formula, since that's easier to verify is correct without being
-     * able to run it.
+     * Adapts the same pivot-around-a-point idea from the old
+     * single-image model to one placed image among many: returns
+     * a copy of `referenceImage` with scale/rotation changed to
+     * newScale/newRotation, with position solved so that whatever was
+     * at screen point (referenceFocusX, referenceFocusY) under
+     * referenceImage's old placement ends up at (newFocusX, newFocusY)
+     * after the change. referenceFocusX/Y and newFocusX/Y can differ,
+     * which is what lets pan fall out of the same calculation as a
+     * two-finger gesture's midpoint moves, rather than needing
+     * separate pan-tracking.
      */
-    fun pivotTransform(
-        referenceTransform: TransformState,
+    fun pivotPlacedImage(
+        referenceImage: PlacedImage,
         referenceFocusX: Float,
         referenceFocusY: Float,
-        newZoom: Float,
+        newScale: Float,
         newRotation: Float,
         newFocusX: Float,
         newFocusY: Float,
-        srcWidth: Int,
-        srcHeight: Int,
         dstWidth: Int,
         dstHeight: Int,
-    ): TransformState {
-        val refMatrix = buildTransformMatrix(srcWidth, srcHeight, dstWidth, dstHeight, referenceTransform)
+    ): PlacedImage {
+        val refMatrix = buildPlacedImageMatrix(referenceImage, dstWidth, dstHeight)
         val inverse = Matrix()
         if (!refMatrix.invert(inverse)) {
-            // Degenerate matrix (shouldn't normally happen) -- apply the
-            // change without a pivot adjustment rather than crash.
-            return referenceTransform.copy(zoomScale = newZoom, rotationAngle = newRotation)
+            return referenceImage.copy(scale = newScale, rotationAngle = newRotation)
         }
         val imagePoint = floatArrayOf(referenceFocusX, referenceFocusY)
         inverse.mapPoints(imagePoint)
 
-        // See where that same image-space point lands with the NEW
-        // zoom/rotation but zero pan, then the gap between that and the
-        // NEW focus point is exactly the pan needed to close it.
-        val noPan = TransformState(zoomScale = newZoom, rotationAngle = newRotation)
-        val noPanMatrix = buildTransformMatrix(srcWidth, srcHeight, dstWidth, dstHeight, noPan)
+        val noPan = referenceImage.copy(
+            scale = newScale,
+            rotationAngle = newRotation,
+            centerXFraction = 0f,
+            centerYFraction = 0f,
+        )
+        val noPanMatrix = buildPlacedImageMatrix(noPan, dstWidth, dstHeight)
         val mapped = floatArrayOf(imagePoint[0], imagePoint[1])
         noPanMatrix.mapPoints(mapped)
 
         val panPxX = newFocusX - mapped[0]
         val panPxY = newFocusY - mapped[1]
 
-        return TransformState(
-            zoomScale = newZoom,
+        return referenceImage.copy(
+            scale = newScale,
             rotationAngle = newRotation,
-            panXFraction = panPxX / dstWidth,
-            panYFraction = panPxY / dstHeight,
-
+            centerXFraction = panPxX / dstWidth,
+            centerYFraction = panPxY / dstHeight,
         )
     }
 
     /**
-     * Renders `source` onto a new dstW x dstH bitmap using the given
-     * transform, filling any area the (possibly zoomed-out/panned)
-     * source doesn't cover with fillColor. This is the shared
-     * rendering path for both the interactive view's live drawing and
-     * the final print bake.
+     * Returns the placed image (if any) whose bounds contain screen
+     * point (x, y) on a dstW x dstH canvas, checked in reverse list
+     * order so later-added (visually on-top, when overlapping) images
+     * are hit-tested first.
      */
-    fun bakeBitmap(source: Bitmap, dstWidth: Int, dstHeight: Int, transform: TransformState, fillColor: Int): Bitmap {
-        val matrix = buildTransformMatrix(source.width, source.height, dstWidth, dstHeight, transform)
-        val canvas = Bitmap.createBitmap(dstWidth, dstHeight, Bitmap.Config.ARGB_8888)
-        val c = Canvas(canvas)
-        c.drawColor(fillColor)
-        val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG or android.graphics.Paint.FILTER_BITMAP_FLAG)
-        c.drawBitmap(source, matrix, paint)
-        return canvas
+    fun hitTestPlacedImage(images: List<PlacedImage>, x: Float, y: Float, dstWidth: Int, dstHeight: Int): PlacedImage? {
+        for (image in images.asReversed()) {
+            val matrix = buildPlacedImageMatrix(image, dstWidth, dstHeight)
+            val inverse = Matrix()
+            if (!matrix.invert(inverse)) continue
+            val pt = floatArrayOf(x, y)
+            inverse.mapPoints(pt)
+            if (pt[0] in 0f..image.bitmap.width.toFloat() && pt[1] in 0f..image.bitmap.height.toFloat()) {
+                return image
+            }
+        }
+        return null
     }
 
     /**
-     * Adds solid-color bars (centered) so the bitmap's dimensions
-     * exactly match ratioW:ratioH, without cropping any original
-     * content. Returns the same bitmap unchanged if already that ratio.
+     * Screen-space position of `image`'s delete-button anchor (its
+     * top-right corner, after scale/rotation/position are applied).
+     * Used identically for drawing the button and for hit-testing taps
+     * against it, so they can never disagree with each other.
      */
-    fun padToRatio(source: Bitmap, ratioW: Int, ratioH: Int, fillColor: Int): Bitmap {
-        val width = source.width
-        val height = source.height
-        val targetRatio = ratioW.toDouble() / ratioH
-        val currentRatio = width.toDouble() / height
+    fun deleteButtonScreenPosition(image: PlacedImage, dstWidth: Int, dstHeight: Int): FloatArray {
+        val matrix = buildPlacedImageMatrix(image, dstWidth, dstHeight)
+        val corner = floatArrayOf(image.bitmap.width.toFloat(), 0f)
+        matrix.mapPoints(corner)
+        return corner
+    }
 
-        if (Math.abs(currentRatio - targetRatio) < 1e-9) {
-            return source
-        }
+    /**
+     * The four corners of `image`'s bounds in screen space (top-left,
+     * top-right, bottom-right, bottom-left, in that order), already
+     * rotated/scaled/positioned -- used to draw its bounding box.
+     */
+    fun boundingBoxCorners(image: PlacedImage, dstWidth: Int, dstHeight: Int): FloatArray {
+        val matrix = buildPlacedImageMatrix(image, dstWidth, dstHeight)
+        val w = image.bitmap.width.toFloat()
+        val h = image.bitmap.height.toFloat()
+        val corners = floatArrayOf(0f, 0f, w, 0f, w, h, 0f, h)
+        matrix.mapPoints(corners)
+        return corners
+    }
 
-        val newWidth: Int
-        val newHeight: Int
-        if (currentRatio > targetRatio) {
-            newWidth = width
-            newHeight = Math.round(width * ratioH.toDouble() / ratioW).toInt()
-        } else {
-            newHeight = height
-            newWidth = Math.round(height * ratioW.toDouble() / ratioH).toInt()
-        }
-
-        val canvas = Bitmap.createBitmap(newWidth, newHeight, Bitmap.Config.ARGB_8888)
+    /**
+     * Renders every placed image onto one dstW x dstH bitmap, in list
+     * order (later entries draw on top of earlier ones where they
+     * overlap), filling everything else with backgroundColor. Shared
+     * by both the live interactive view and the final print bake.
+     */
+    fun bakeComposite(images: List<PlacedImage>, dstWidth: Int, dstHeight: Int, backgroundColor: Int): Bitmap {
+        val canvas = Bitmap.createBitmap(dstWidth, dstHeight, Bitmap.Config.ARGB_8888)
         val c = Canvas(canvas)
-        c.drawColor(fillColor)
-        val offsetX = (newWidth - width) / 2
-        val offsetY = (newHeight - height) / 2
-        c.drawBitmap(source, offsetX.toFloat(), offsetY.toFloat(), null)
+        c.drawColor(backgroundColor)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        for (image in images) {
+            val matrix = buildPlacedImageMatrix(image, dstWidth, dstHeight)
+            c.drawBitmap(image.bitmap, matrix, paint)
+        }
         return canvas
     }
 
     /**
      * Rotates a bitmap by an arbitrary multiple of 90 degrees
      * (0, 90, 180, or 270; other values are normalized into that set).
-     * Returns the same bitmap unchanged for a 0-degree rotation.
+     * Used for EXIF correction on load; per-placed-image rotation uses
+     * PlacedImage.rotationAngle (continuous) instead, not this.
      */
     fun rotateBitmap(source: Bitmap, degrees: Int): Bitmap {
         val normalized = ((degrees % 360) + 360) % 360
@@ -289,54 +262,38 @@ object ImagePrep {
     }
 
     /**
-     * Loads the image at `uri`, applies EXIF correction and the coarse
-     * rotationDegrees snap, and optionally pads to exactly 2:3. This
-     * is the "source" bitmap the interactive preview view frames via
-     * pinch/rotate/pan -- NOT yet cropped/scaled to the print canvas.
+     * Loads the image at `uri` and applies EXIF correction. This is
+     * the bitmap a new PlacedImage wraps -- not yet scaled/positioned
+     * to anything, that's handled by the canvas layout (see
+     * buildPlacedImageMatrix) and the user's gestures.
      */
-    fun prepareSourceBitmap(
-        context: Context,
-        uri: Uri,
-        rotationDegrees: Int = 0,
-        padTo2x3: Boolean = false,
-        padFillColor: Int = Color.WHITE,
-    ): Bitmap {
+    fun loadOrientedBitmap(context: Context, uri: Uri): Bitmap {
         val inputStream = context.contentResolver.openInputStream(uri)
             ?: throw IllegalArgumentException("Could not open image at $uri")
         var src = inputStream.use { android.graphics.BitmapFactory.decodeStream(it) }
             ?: throw IllegalArgumentException("Could not decode image at $uri")
-
         src = applyExifOrientation(context, uri, src)
-        src = rotateBitmap(src, rotationDegrees)
-
-        if (padTo2x3) {
-            src = padToRatio(src, 2, 3, padFillColor)
-        }
         return src
     }
 
     /**
-     * Takes an already-prepared source bitmap (see prepareSourceBitmap)
-     * and the user's current framing (see TransformState/InteractivePreviewView)
-     * and produces the two JPEG buffers the printer expects.
+     * Composites all placed images and produces the two JPEG buffers
+     * the printer expects.
      *
-     * @param transform the user's current zoom/rotate/pan framing,
-     *   read from the interactive preview view at print time. Its
-     *   default reproduces the old fixed "auto-crop to cover" behavior.
-     * @param padFillColor also used as the fill color for any canvas
-     *   area the framed source doesn't cover (e.g. zoomed out).
+     * @param backgroundColor fills any canvas area not covered by an
+     *   image -- now a full ARGB color from the color picker, not just
+     *   black/white.
      * @param maxPreviewBytes automatically lowers JPEG quality below
      *   `quality` as needed to keep the preview under this many bytes.
      *   Pass null to disable and always use the exact quality given.
      */
     fun prepareImage(
-        source: Bitmap,
-        transform: TransformState = TransformState(),
+        images: List<PlacedImage>,
+        backgroundColor: Int,
         quality: Int = 95,
-        padFillColor: Int = Color.WHITE,
         maxPreviewBytes: Int? = DEFAULT_MAX_PREVIEW_BYTES,
     ): PreparedImage {
-        val preview = bakeBitmap(source, PREVIEW_WIDTH, PREVIEW_HEIGHT, transform, padFillColor)
+        val preview = bakeComposite(images, PREVIEW_WIDTH, PREVIEW_HEIGHT, backgroundColor)
         val final = rotateBitmap(
             Bitmap.createScaledBitmap(preview, FINAL_WIDTH, FINAL_HEIGHT, true),
             180,
@@ -350,29 +307,6 @@ object ImagePrep {
         val finalBytes = encodeJpeg(final, usedQuality)
 
         return PreparedImage(previewBytes, finalBytes, usedQuality)
-    }
-
-    /**
-     * Convenience one-shot version: loads from a Uri and prepares in
-     * one call, using the default TransformState (equivalent to the
-     * old fixed auto-crop behavior). Mainly useful for testing/CLI-style
-     * use; MainActivity's normal flow uses prepareSourceBitmap() +
-     * the interactive view + this class's prepareImage(source, ...)
-     * separately, since framing needs to be interactively adjustable
-     * between those two steps.
-     */
-    fun prepareImage(
-        context: Context,
-        uri: Uri,
-        rotationDegrees: Int = 0,
-        transform: TransformState = TransformState(),
-        quality: Int = 95,
-        padTo2x3: Boolean = false,
-        padFillColor: Int = Color.WHITE,
-        maxPreviewBytes: Int? = DEFAULT_MAX_PREVIEW_BYTES,
-    ): PreparedImage {
-        val source = prepareSourceBitmap(context, uri, rotationDegrees, padTo2x3, padFillColor)
-        return prepareImage(source, transform, quality, padFillColor, maxPreviewBytes)
     }
 
     private fun applyExifOrientation(context: Context, uri: Uri, bitmap: Bitmap): Bitmap {

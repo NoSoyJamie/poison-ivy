@@ -45,11 +45,11 @@
             android:layout_height="wrap_content"
             android:text="Find printer" />
 
-        <!-- Image selection -->
+        <!-- Images -->
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Image"
+            android:text="Images"
             android:textStyle="bold"
             android:layout_marginTop="24dp" />
 
@@ -57,54 +57,53 @@
             android:id="@+id/previewContainer"
             android:layout_width="match_parent"
             android:layout_height="300dp"
-            android:layout_marginTop="8dp"
-            android:layout_marginBottom="8dp">
+            android:layout_marginTop="8dp">
 
             <com.poisonivy.printer.InteractivePreviewView
                 android:id="@+id/imagePreview"
                 android:layout_width="match_parent"
                 android:layout_height="match_parent"
                 android:background="#EEEEEE"
-                android:contentDescription="Preview of exactly what will print -- drag to pan, pinch to zoom, twist with two fingers to rotate" />
+                android:contentDescription="Sticker sheet preview -- tap an image to select it, tap its corner button to delete it, two-finger drag/pinch/twist to move, scale, and rotate the selected image" />
+
+        </FrameLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:layout_marginTop="4dp"
+            android:layout_marginBottom="4dp">
 
             <Button
                 android:id="@+id/resetPreviewButton"
                 style="?android:attr/buttonStyleSmall"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_gravity="bottom|start"
-                android:layout_margin="6dp"
                 android:text="Reset" />
 
-            <LinearLayout
+            <Button
+                android:id="@+id/undoPreviewButton"
+                style="?android:attr/buttonStyleSmall"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_gravity="bottom|end"
-                android:layout_margin="6dp"
-                android:orientation="horizontal">
+                android:layout_marginStart="4dp"
+                android:text="Undo" />
 
-                <Button
-                    android:id="@+id/undoPreviewButton"
-                    style="?android:attr/buttonStyleSmall"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Undo" />
-
-                <Button
-                    android:id="@+id/redoPreviewButton"
-                    style="?android:attr/buttonStyleSmall"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginStart="4dp"
-                    android:text="Redo" />
-            </LinearLayout>
-
-        </FrameLayout>
+            <Button
+                android:id="@+id/redoPreviewButton"
+                style="?android:attr/buttonStyleSmall"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="4dp"
+                android:text="Redo" />
+        </LinearLayout>
 
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Drag to pan, pinch to zoom, twist with two fingers to rotate. This preview shows exactly the framing that will print."
+            android:text="Tap an image to select it (highlighted in green); tap the small button on its corner to delete it. Two-finger drag/pinch/twist moves, scales, and rotates the selected image together. This preview shows exactly what will print."
             android:textSize="12sp"
             android:layout_marginBottom="4dp" />
 
@@ -119,13 +118,13 @@
                 android:id="@+id/rotateButton"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="Rotate 90°" />
+                android:text="Rotate selected 90°" />
 
             <TextView
                 android:id="@+id/rotationLabel"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="Rotation: 0°"
+                android:text="No image selected"
                 android:layout_marginStart="12dp"
                 android:textStyle="bold" />
         </LinearLayout>
@@ -134,7 +133,7 @@
             android:id="@+id/pickImageButton"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Pick image" />
+            android:text="Add image(s)" />
 
         <!-- Options -->
         <TextView
@@ -144,35 +143,32 @@
             android:textStyle="bold"
             android:layout_marginTop="24dp" />
 
-        <CheckBox
-            android:id="@+id/padCheckbox"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Pad to 2:3 instead of cropping (use for card scans)"
-            android:layout_marginTop="8dp" />
-
-        <RadioGroup
-            android:id="@+id/padColorGroup"
+        <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
+            android:text="Background color"
+            android:layout_marginTop="8dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
             android:orientation="horizontal"
-            android:layout_marginStart="32dp"
+            android:gravity="center_vertical"
             android:layout_marginBottom="8dp">
 
-            <RadioButton
-                android:id="@+id/padColorWhite"
+            <Button
+                android:id="@+id/backgroundColorButton"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="White bars"
-                android:checked="true" />
+                android:text="Choose color" />
 
-            <RadioButton
-                android:id="@+id/padColorBlack"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Black bars"
-                android:layout_marginStart="16dp" />
-        </RadioGroup>
+            <View
+                android:id="@+id/backgroundColorSwatch"
+                android:layout_width="32dp"
+                android:layout_height="32dp"
+                android:layout_marginStart="12dp"
+                android:background="#FFFFFF" />
+        </LinearLayout>
 
         <TextView
             android:layout_width="wrap_content"
@@ -212,7 +208,8 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
             android:padding="8dp"
-            android:background="#EEEEEE"
+            android:background="@android:color/transparent"
+            android:textColor="#FFFFFF"
             android:fontFamily="monospace"
             android:textSize="11sp"
             android:text="Ready." />

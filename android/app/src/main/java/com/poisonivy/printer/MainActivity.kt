@@ -8,18 +8,18 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.view.View
 import android.widget.ArrayAdapter
 import android.widget.Button
-import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
-import android.widget.RadioGroup
+import android.widget.LinearLayout
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -43,28 +43,20 @@ class MainActivity : AppCompatActivity() {
     private lateinit var rotateButton: Button
     private lateinit var rotationLabel: TextView
     private lateinit var pickImageButton: Button
-    private lateinit var padCheckbox: CheckBox
-    private lateinit var padColorGroup: RadioGroup
+    private lateinit var backgroundColorButton: Button
+    private lateinit var backgroundColorSwatch: View
     private lateinit var maxSizeInput: EditText
     private lateinit var printButton: Button
     private lateinit var statusLog: TextView
 
     private var selectedDevice: BluetoothDevice? = null
-    private var selectedImageUri: Uri? = null
-    private var rotationDegrees: Int = 0
+    private var nextImageId = 0L
 
-    // The oriented (EXIF + coarse rotationDegrees) and optionally padded
-    // bitmap that the interactive view frames via pinch/rotate/pan. This
-    // is what actually gets baked into the final print, using whatever
-    // transform the view currently holds.
-    private var sourceBitmap: Bitmap? = null
-
-    // Undo/redo history for the interactive transform: a simple list +
-    // pointer. Resets to a single default entry whenever the source
-    // bitmap changes (new image, coarse rotation, or pad option change),
-    // since those are structural changes the old fine-adjustment history
-    // doesn't meaningfully apply to anymore.
-    private val transformHistory = mutableListOf(ImagePrep.TransformState())
+    // Undo/redo history for the whole image layout: a simple list of
+    // full-list snapshots plus a pointer, same pattern as the old
+    // single-image version's transform history, just snapshotting the
+    // whole List<PlacedImage> now instead of one TransformState.
+    private val layoutHistory = mutableListOf<List<ImagePrep.PlacedImage>>(emptyList())
     private var historyIndex = 0
 
     private var discoveryReceiver: BroadcastReceiver? = null
@@ -89,15 +81,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private val pickImageLauncher = registerForActivityResult(
-        ActivityResultContracts.GetContent()
-    ) { uri ->
-        if (uri != null) {
-            selectedImageUri = uri
-            rotationDegrees = 0
-            updateRotationLabel()
-            regenerateSourceBitmap()
-            updatePrintButtonEnabled()
+    private val pickImagesLauncher = registerForActivityResult(
+        ActivityResultContracts.GetMultipleContents()
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            addImages(uris)
         }
     }
 
@@ -115,50 +103,41 @@ class MainActivity : AppCompatActivity() {
         rotateButton = findViewById(R.id.rotateButton)
         rotationLabel = findViewById(R.id.rotationLabel)
         pickImageButton = findViewById(R.id.pickImageButton)
-        padCheckbox = findViewById(R.id.padCheckbox)
-        padColorGroup = findViewById(R.id.padColorGroup)
+        backgroundColorButton = findViewById(R.id.backgroundColorButton)
+        backgroundColorSwatch = findViewById(R.id.backgroundColorSwatch)
         maxSizeInput = findViewById(R.id.maxSizeInput)
         printButton = findViewById(R.id.printButton)
         statusLog = findViewById(R.id.statusLog)
 
         selectDeviceButton.setOnClickListener { requestPermissionsThenShowDevices() }
-        pickImageButton.setOnClickListener { pickImageLauncher.launch("image/*") }
+        pickImageButton.setOnClickListener { pickImagesLauncher.launch("image/*") }
         printButton.setOnClickListener { startPrint() }
 
-        rotateButton.setOnClickListener {
-            rotationDegrees = (rotationDegrees + 90) % 360
-            updateRotationLabel()
-            regenerateSourceBitmap()
-        }
-        padCheckbox.setOnCheckedChangeListener { _, _ -> regenerateSourceBitmap() }
-        padColorGroup.setOnCheckedChangeListener { _, _ -> regenerateSourceBitmap() }
+        rotateButton.setOnClickListener { imagePreview.rotateSelectedImage90() }
+        resetPreviewButton.setOnClickListener { imagePreview.resetSelectedImage() }
+        undoPreviewButton.setOnClickListener { undoLayout() }
+        redoPreviewButton.setOnClickListener { redoLayout() }
+        backgroundColorButton.setOnClickListener { showBackgroundColorPicker() }
 
-        imagePreview.onTransformCommitted = { newState -> pushHistory(newState) }
-        resetPreviewButton.setOnClickListener {
-            imagePreview.resetTransform()
-            pushHistory(ImagePrep.TransformState())
-        }
-        undoPreviewButton.setOnClickListener { undoTransform() }
-        redoPreviewButton.setOnClickListener { redoTransform() }
+        imagePreview.onImagesChanged = { newImages -> pushHistory(newImages) }
+        imagePreview.onSelectionChanged = { updateSelectionUi(it) }
+        imagePreview.backgroundColor = Color.WHITE
+
         updateHistoryButtonsEnabled()
-
+        updateSelectionUi(null)
         lockPreviewContainerTo2x3()
     }
 
     /**
      * Forces the preview container's shape to exactly 2:3 (width:height),
-     * matching the final print canvas's own proportions. This isn't just
-     * cosmetic: InteractivePreviewView computes its "cover" auto-scale
-     * from its own measured width/height, and the final print bake uses
-     * a fixed 1280x1920 (also 2:3) canvas -- if the on-screen container
-     * were a different aspect ratio, the same zoom/pan/rotation values
-     * would frame the image differently on screen than in the final
-     * print, breaking the "what you see is what prints" guarantee this
-     * whole preview exists for. Computed from the container's actual
-     * measured width once layout has happened, rather than an XML
-     * aspect-ratio constraint, so this is easy to verify is correct
-     * (plain arithmetic) without needing to compile-test constraint-ratio
-     * syntax.
+     * matching the final print canvas's own proportions -- required for
+     * "what you see is what prints" to actually hold, since
+     * InteractivePreviewView computes each placed image's default size
+     * and position relative to its OWN measured width/height. Computed
+     * from the container's actual measured width once layout has
+     * happened, rather than an XML aspect-ratio constraint, so this is
+     * easy to verify is correct (plain arithmetic) without needing to
+     * compile-test constraint-ratio syntax.
      */
     private fun lockPreviewContainerTo2x3() {
         previewContainer.post {
@@ -174,79 +153,149 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun updateRotationLabel() {
-        rotationLabel.text = "Rotation: ${rotationDegrees}°"
-    }
-
-    /**
-     * Rebuilds the oriented/padded source bitmap (EXIF correction +
-     * coarse rotationDegrees + optional 2:3 padding) whenever any of
-     * those inputs change, assigns it to the interactive view (which
-     * resets its own zoom/pan/rotate transform back to default whenever
-     * the source changes -- a new source invalidates old fine-tuned
-     * framing anyway), and resets the undo/redo history to match.
-     */
-    private fun regenerateSourceBitmap() {
-        val uri = selectedImageUri ?: return
-        val padTo2x3 = padCheckbox.isChecked
-        val padColor = if (padColorGroup.checkedRadioButtonId == R.id.padColorBlack) Color.BLACK else Color.WHITE
-        val rotation = rotationDegrees
-
+    private fun addImages(uris: List<Uri>) {
         lifecycleScope.launch {
             try {
-                val bitmap = withContext(Dispatchers.IO) {
-                    ImagePrep.prepareSourceBitmap(
-                        context = this@MainActivity,
-                        uri = uri,
-                        rotationDegrees = rotation,
-                        padTo2x3 = padTo2x3,
-                        padFillColor = padColor,
-                    )
+                val newImages = withContext(Dispatchers.IO) {
+                    uris.mapIndexed { index, uri ->
+                        val bitmap = ImagePrep.loadOrientedBitmap(this@MainActivity, uri)
+                        // Cascade each new image's default position slightly so a
+                        // multi-image add doesn't stack everything in one spot.
+                        val step = 0.06f
+                        val slot = index % 5
+                        ImagePrep.PlacedImage(
+                            id = nextImageId++,
+                            bitmap = bitmap,
+                            centerXFraction = 0.5f + slot * step - 0.12f,
+                            centerYFraction = 0.5f + slot * step - 0.12f,
+                        )
+                    }
                 }
-                sourceBitmap = bitmap
-                imagePreview.backgroundFillColor = padColor
-                imagePreview.sourceBitmap = bitmap // resets the view's own transform to default
-                transformHistory.clear()
-                transformHistory.add(ImagePrep.TransformState())
-                historyIndex = 0
-                updateHistoryButtonsEnabled()
+                val updated = imagePreview.placedImages + newImages
+                imagePreview.placedImages = updated
+                imagePreview.selectImage(newImages.lastOrNull()?.id)
+                pushHistory(updated)
+                updatePrintButtonEnabled()
             } catch (e: Exception) {
                 log("Could not load image: ${e.message}")
             }
         }
     }
 
+    private fun updateSelectionUi(selectedId: Long?) {
+        val selected = imagePreview.placedImages.firstOrNull { it.id == selectedId }
+        if (selected != null) {
+            rotationLabel.text = "Selected: ${Math.round(((selected.rotationAngle % 360) + 360) % 360)}°"
+            rotateButton.isEnabled = true
+            resetPreviewButton.isEnabled = true
+        } else {
+            rotationLabel.text = "No image selected"
+            rotateButton.isEnabled = false
+            resetPreviewButton.isEnabled = false
+        }
+    }
+
+    private fun showBackgroundColorPicker() {
+        val initial = imagePreview.backgroundColor
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val pad = (16 * resources.displayMetrics.density).toInt()
+            setPadding(pad, pad, pad, pad)
+        }
+
+        val preview = View(this)
+        preview.layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            (48 * resources.displayMetrics.density).toInt()
+        )
+        preview.setBackgroundColor(initial)
+        container.addView(preview)
+
+        var r = Color.red(initial)
+        var g = Color.green(initial)
+        var b = Color.blue(initial)
+
+        fun updatePreviewSwatch() {
+            preview.setBackgroundColor(Color.rgb(r, g, b))
+        }
+
+        fun addChannelRow(label: String, initialValue: Int, onChange: (Int) -> Unit) {
+            val labelView = TextView(this)
+            labelView.text = "$label: $initialValue"
+            labelView.setPadding(0, (8 * resources.displayMetrics.density).toInt(), 0, 0)
+            container.addView(labelView)
+
+            val seekBar = SeekBar(this)
+            seekBar.max = 255
+            seekBar.progress = initialValue
+            seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, value: Int, fromUser: Boolean) {
+                    labelView.text = "$label: $value"
+                    onChange(value)
+                    updatePreviewSwatch()
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {}
+            })
+            container.addView(seekBar)
+        }
+
+        addChannelRow("Red", r) { r = it }
+        addChannelRow("Green", g) { g = it }
+        addChannelRow("Blue", b) { b = it }
+
+        AlertDialog.Builder(this)
+            .setTitle("Background color")
+            .setView(container)
+            .setPositiveButton("OK") { _, _ ->
+                val chosen = Color.rgb(r, g, b)
+                imagePreview.backgroundColor = chosen
+                backgroundColorSwatch.setBackgroundColor(chosen)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     // ---------------------------------------------------------------
-    // Undo / redo history for the interactive transform
+    // Undo / redo history for the whole image layout
     // ---------------------------------------------------------------
 
-    private fun pushHistory(state: ImagePrep.TransformState) {
-        // Discard any "redo" entries beyond the current point, then append.
-        while (transformHistory.size > historyIndex + 1) {
-            transformHistory.removeAt(transformHistory.size - 1)
+    private fun pushHistory(images: List<ImagePrep.PlacedImage>) {
+        while (layoutHistory.size > historyIndex + 1) {
+            layoutHistory.removeAt(layoutHistory.size - 1)
         }
-        transformHistory.add(state)
-        historyIndex = transformHistory.size - 1
+        layoutHistory.add(images)
+        historyIndex = layoutHistory.size - 1
         updateHistoryButtonsEnabled()
     }
 
-    private fun undoTransform() {
+    private fun undoLayout() {
         if (historyIndex <= 0) return
         historyIndex--
-        imagePreview.transform = transformHistory[historyIndex]
-        updateHistoryButtonsEnabled()
+        applyHistoryState(layoutHistory[historyIndex])
     }
 
-    private fun redoTransform() {
-        if (historyIndex >= transformHistory.size - 1) return
+    private fun redoLayout() {
+        if (historyIndex >= layoutHistory.size - 1) return
         historyIndex++
-        imagePreview.transform = transformHistory[historyIndex]
+        applyHistoryState(layoutHistory[historyIndex])
+    }
+
+    private fun applyHistoryState(images: List<ImagePrep.PlacedImage>) {
+        imagePreview.placedImages = images
+        val stillSelected = images.any { it.id == imagePreview.selectedImageId }
+        if (!stillSelected) {
+            imagePreview.selectImage(images.lastOrNull()?.id)
+        } else {
+            updateSelectionUi(imagePreview.selectedImageId)
+        }
         updateHistoryButtonsEnabled()
     }
 
     private fun updateHistoryButtonsEnabled() {
         undoPreviewButton.isEnabled = historyIndex > 0
-        redoPreviewButton.isEnabled = historyIndex < transformHistory.size - 1
+        redoPreviewButton.isEnabled = historyIndex < layoutHistory.size - 1
     }
 
     // ---------------------------------------------------------------
@@ -379,14 +428,14 @@ class MainActivity : AppCompatActivity() {
     // ---------------------------------------------------------------
 
     private fun updatePrintButtonEnabled() {
-        printButton.isEnabled = selectedDevice != null && selectedImageUri != null
+        printButton.isEnabled = selectedDevice != null && imagePreview.placedImages.isNotEmpty()
     }
 
     private fun startPrint() {
         val device = selectedDevice ?: return
-        val source = sourceBitmap ?: return
-        val transform = imagePreview.transform
-        val padColor = if (padColorGroup.checkedRadioButtonId == R.id.padColorBlack) Color.BLACK else Color.WHITE
+        val images = imagePreview.placedImages
+        if (images.isEmpty()) return
+        val backgroundColor = imagePreview.backgroundColor
         val maxSize = maxSizeInput.text.toString().toIntOrNull() ?: ImagePrep.DEFAULT_MAX_PREVIEW_BYTES
 
         printButton.isEnabled = false
@@ -394,12 +443,11 @@ class MainActivity : AppCompatActivity() {
 
         lifecycleScope.launch {
             try {
-                log("Preparing image...")
+                log("Preparing ${images.size} image(s)...")
                 val prepared = withContext(Dispatchers.IO) {
                     ImagePrep.prepareImage(
-                        source = source,
-                        transform = transform,
-                        padFillColor = padColor,
+                        images = images,
+                        backgroundColor = backgroundColor,
                         maxPreviewBytes = maxSize,
                     )
                 }

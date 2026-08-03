@@ -20,30 +20,33 @@ RFCOMM channels on this printer (see below).
 
 - Lists your phone's paired Bluetooth devices (and can actively scan
   for/pair new ones) so you can pick the printer.
-- Opens the system image picker -- any photo, any app that exposes
-  images (Gallery, Files, Google Photos, etc).
-- Interactive preview: drag to pan, pinch to zoom, twist with two
-  fingers to rotate, with Reset/Undo/Redo. This renders using the
-  exact same math used to build what actually gets sent to the
-  printer (see `ImagePrep.buildTransformMatrix`), at the same 2:3
-  proportions as the real print -- what you see is what prints,
-  including your manual framing adjustments.
-- A separate "Rotate 90°" button for a quick, precise coarse snap
-  (independent of and prior to the interactive fine adjustment above)
-  for when the source image's orientation doesn't match the printed
-  sheet's, which the physical paper is always 2:3 regardless of what
-  you feed in. There is no currently-known-correct default rotation
-  baked in -- see [Calibrating rotation](#calibrating-rotation) below.
-- Options: pad-to-2:3 (for card scans, so nothing gets cropped instead
-  of relying on manual zoom-out), pad bar color, and max output size
-  in bytes (defaults to 400,000, the Python project's tested-safe
-  value).
+- **Sticker sheet layout**: add any number of images (the system
+  picker's multi-select) and arrange them independently on one shared
+  2:3 canvas -- tap an image to select it (highlighted in green), tap
+  the small button on its corner to delete it, and use a two-finger
+  gesture (drag/pinch/twist) to move, scale, and rotate the selected
+  image, all from one continuous motion.
+- The preview renders using the exact same functions used to build
+  what actually gets sent to the printer (`ImagePrep.buildPlacedImageMatrix`
+  / `bakeComposite`), at the same 2:3 proportions as the real print --
+  what you see is what prints, including every image's individual
+  placement.
+- A "Rotate selected 90°" button for a quick, precise coarse snap on
+  top of the interactive fine rotation, and a "Reset" button that
+  returns just the selected image to its default centered placement.
+  Undo/redo cover the whole layout (add, delete, move/scale/rotate),
+  not just one image at a time.
+- Background color is a full picker (RGB sliders + live swatch), not
+  just black/white.
+- Max output size in bytes, still defaulting to 400,000 (the Python
+  project's tested-safe value) -- this applies to the whole composited
+  sheet, not per image.
 
 ## Calibrating rotation
 
 The printed sheet is always physically 2:3, but source images aren't
-always already in that orientation, and there's reason to think the
-printer/protocol has its own fixed orientation expectations
+always already in the orientation you want, and there's reason to
+think the printer/protocol has its own fixed orientation expectations
 independent of the source file (the very first image this whole
 project's protocol was reverse-engineered from was itself stored
 sideways relative to how a person would naturally view it -- see the
@@ -51,16 +54,16 @@ Python project's history). This app can't determine the "correct"
 rotation on its own since it was written without the ability to test
 an actual print.
 
-To calibrate: pick an image with an obvious "up" (text works well),
+To calibrate: place one image with an obvious "up" (text works well),
 print it at 0° rotation, and see how it comes out physically. If it's
-wrong, note which way (90° clockwise, 180°, etc.), tap **Rotate 90°**
-that many times before your next print (this resets the interactive
-pan/zoom/rotate back to default too, so recalibrate before doing any
-fine framing), and it should come out right from then on. Once you've
-found the correct offset, it's worth a small code change to make that
-the default `rotationDegrees` in `MainActivity` rather than
-re-rotating by hand every time -- happy to make that change once you
-know the number.
+wrong, note which way (90° clockwise, 180°, etc.) and rotate that many
+times -- either via **Rotate selected 90°** for quick snaps, or the
+interactive two-finger twist for anything finer -- before your next
+print, and it should come out right from then on. Since rotation is
+now a per-image property rather than one global setting, there's no
+single default to bake in for this app the way there was before --
+each new image starts at 0° and needs the same calibration offset
+applied if you know one.
 
 ## Known limitations
 
@@ -87,14 +90,19 @@ know the number.
    fallback in `BluetoothPrinter.kt` (an unofficial but commonly-used
    reflection-based method to specify the channel number directly).
 
-3. **The pinch/rotate/pan gesture handling is the newest, least
-   battle-tested part of this app.** The underlying matrix math
-   (`ImagePrep.buildTransformMatrix`) is simple enough to verify by
-   inspection, but the multi-touch pointer bookkeeping in
-   `InteractivePreviewView` (tracking fingers across transitions
-   between one- and two-finger gestures) is exactly the kind of code
-   that most benefits from real on-device testing. If gestures feel
-   janky or jump when adding/removing a second finger, start there.
+3. **The gesture and tap handling is the newest, least battle-tested
+   part of this app**, now including tap-to-select, tap-to-delete, and
+   per-image two-finger manipulation on top of the pinch/rotate/pan
+   from before. The underlying matrix/geometry math in `ImagePrep`
+   (`buildPlacedImageMatrix`, `pivotPlacedImage`, `hitTestPlacedImage`,
+   `deleteButtonScreenPosition`) uses Android's own Matrix
+   invert/mapPoints rather than hand-derived formulas specifically so
+   it's easy to verify by inspection, but things like the tap-vs-drag
+   thresholds and the delete button's hit radius in
+   `InteractivePreviewView` are inherently hands-on judgment calls that
+   most benefit from real on-device tuning. If tapping an image
+   sometimes selects the wrong one, or the delete button is fiddly to
+   hit, start there.
 
 4. There is no longer a "flip preview sideways for display" toggle
    (an earlier version of this app had one) -- it was removed because
@@ -103,6 +111,15 @@ know the number.
    real print canvas) for the same pinch/pan/rotate values to frame
    the image identically in the preview and the final print. Rotating
    the preview's display shape would silently break that guarantee.
+
+5. There is no longer a "pad to 2:3" option (an earlier single-image
+   version of this app had one) -- it doesn't translate cleanly to the
+   multi-image sticker-sheet model, where each image is independently
+   sized/positioned by the user rather than automatically cropped to
+   fill the whole canvas. If you want a specific image's edges fully
+   preserved without cropping, just scale it down (pinch) until its
+   whole bounding box is visible, rather than relying on automatic
+   padding.
 
 ## Building it
 
@@ -139,18 +156,27 @@ You'll need [Android Studio](https://developer.android.com/studio)
 
 ## Relationship to the Python project
 
-This is a straight port of the same reverse-engineered protocol:
+This started as a straight port of the same reverse-engineered
+protocol, and the core Bluetooth/protocol layer still is:
 
 | Python | Android (Kotlin) | Purpose |
 |---|---|---|
-| `poison_ivy/image_prep.py` | `ImagePrep.kt` | Crop/pad/resize/auto-size |
 | `poison_ivy/obex_push.py` | `ObexPush.kt` | OBEX byte stream builder |
 | `poison_ivy/channel2_template.py` | `Channel2Template.kt` | Size-field patcher |
 | `data/channel2_payload.bin` | `assets/channel2_payload.bin` | Same file, copied as-is |
-| `print.py` | `BluetoothPrinter.kt` + `MainActivity.kt` | Connection/send logic + UI |
+| `print.py` | `BluetoothPrinter.kt` | Connection/send logic |
+
+**`ImagePrep.kt` has since diverged** from `image_prep.py`: the
+Android app grew into a multi-image sticker-sheet compositor
+(independent per-image position/scale/rotation, tap-to-select,
+delete buttons, a full color-picker background) that the Python CLI
+tool doesn't have and was never asked to have. If you want that
+functionality in the Python tool too, that's a separate, real chunk
+of work, not a quick port -- ask if you want it.
 
 If you bracket a different size limit, decode more of the channel-2
-protocol, or fix a bug in one, please port the fix to the other --
-they're meant to stay in sync. See the Python project's `PROTOCOL.md`
-for the full technical writeup; nothing protocol-specific is
-duplicated here beyond what's needed for code comments.
+protocol, or fix a bug in the shared protocol layer above, please
+port the fix to the other -- those are meant to stay in sync. See the
+Python project's `PROTOCOL.md` for the full technical writeup;
+nothing protocol-specific is duplicated here beyond what's needed for
+code comments.
