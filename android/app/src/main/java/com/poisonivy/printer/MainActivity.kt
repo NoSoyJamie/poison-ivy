@@ -121,7 +121,7 @@ class MainActivity : AppCompatActivity() {
 
         imagePreview.onImagesChanged = { newImages -> pushHistory(newImages) }
         imagePreview.onSelectionChanged = { updateSelectionUi(it) }
-        imagePreview.backgroundColor = Color.WHITE
+        imagePreview.canvasBackgroundColor = Color.WHITE
 
         updateHistoryButtonsEnabled()
         updateSelectionUi(null)
@@ -196,7 +196,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showBackgroundColorPicker() {
-        val initial = imagePreview.backgroundColor
+        val initial = imagePreview.canvasBackgroundColor
 
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -250,7 +250,7 @@ class MainActivity : AppCompatActivity() {
             .setView(container)
             .setPositiveButton("OK") { _, _ ->
                 val chosen = Color.rgb(r, g, b)
-                imagePreview.backgroundColor = chosen
+                imagePreview.canvasBackgroundColor = chosen
                 backgroundColorSwatch.setBackgroundColor(chosen)
             }
             .setNegativeButton("Cancel", null)
@@ -435,7 +435,7 @@ class MainActivity : AppCompatActivity() {
         val device = selectedDevice ?: return
         val images = imagePreview.placedImages
         if (images.isEmpty()) return
-        val backgroundColor = imagePreview.backgroundColor
+        val backgroundColor = imagePreview.canvasBackgroundColor
         val maxSize = maxSizeInput.text.toString().toIntOrNull() ?: ImagePrep.DEFAULT_MAX_PREVIEW_BYTES
 
         printButton.isEnabled = false

@@ -86,7 +86,12 @@ class InteractivePreviewView @JvmOverloads constructor(
             invalidate()
         }
 
-    var backgroundColor: Int = Color.WHITE
+    // Named canvasBackgroundColor (not backgroundColor) deliberately --
+    // View already has its own setBackgroundColor(Int), and a Kotlin
+    // property literally named backgroundColor generates a setter with
+    // the exact same JVM signature, which the compiler correctly
+    // rejects as an accidental override.
+    var canvasBackgroundColor: Int = Color.WHITE
         set(value) {
             field = value
             invalidate()
@@ -397,7 +402,7 @@ class InteractivePreviewView @JvmOverloads constructor(
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        canvas.drawColor(backgroundColor)
+        canvas.drawColor(canvasBackgroundColor)
         if (width <= 0 || height <= 0) return
 
         for (image in placedImages) {
