@@ -7,8 +7,10 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
 import android.util.AttributeSet
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 
 /**
  * A multi-image "sticker sheet" canvas: shows all currently placed
@@ -23,9 +25,20 @@ import android.view.View
  * computed as one unified calculation rather than combining separate
  * zoom/rotate/pan systems).
  *
- * Single-finger touches that aren't a quick tap are left un-acted-on
- * (no requestDisallowInterceptTouchEvent claim) so the enclosing
- * ScrollView is still free to scroll normally with one finger.
+ * There's also a one-finger option for pure repositioning (no scale/
+ * rotation change): press and HOLD on an image -- after the system's
+ * standard long-press duration, that image becomes selected and a
+ * haptic tick confirms you can now drag it with that same finger,
+ * moving only, until you lift. Critically, this only claims the touch
+ * (blocking the enclosing ScrollView from scrolling) once the long
+ * press actually fires -- an ordinary quick single-finger drag never
+ * pauses long enough to trigger it, so normal scrolling is never
+ * interrupted. If a second finger joins mid-drag, this hands off to
+ * the two-finger scale/rotate/pan gesture instead of fighting it.
+ *
+ * Single-finger touches that are neither a quick tap nor a long-press
+ * are left un-acted-on (no requestDisallowInterceptTouchEvent claim)
+ * so the enclosing ScrollView is still free to scroll normally.
  *
  * Rendering uses ImagePrep.buildPlacedImageMatrix()/bakeComposite() --
  * the EXACT same functions used to bake the final print bitmap at
@@ -48,9 +61,12 @@ import android.view.View
  * formulas specifically so it's easier to verify by inspection, but
  * the touch/tap/gesture bookkeeping below is exactly the kind of code
  * that most benefits from real on-device tuning -- tap-vs-drag
- * thresholds (tapSlopPx/tapMaxDurationMs) and the delete-button hit
- * radius (deleteButtonRadiusPx) especially, since "does this feel
- * right" is inherently a hands-on judgment call.
+ * thresholds (tapSlopPx/tapMaxDurationMs), the delete-button hit
+ * radius (deleteButtonRadiusPx), and whether the long-press-to-move
+ * duration (ViewConfiguration.getLongPressTimeout(), a system default
+ * rather than a hardcoded guess, but still worth confirming feels
+ * right here) is the biggest ones, since "does this feel right" is
+ * inherently a hands-on judgment call.
  */
 class InteractivePreviewView @JvmOverloads constructor(
     context: Context,
@@ -124,6 +140,25 @@ class InteractivePreviewView @JvmOverloads constructor(
     private var refAngle = 0f
     private var twoFingerGestureActive = false
 
+    // Long-press-to-move: single-finger repositioning (no scale/rotate),
+    // only active once the hold has actually been recognized.
+    private var longPressImageId: Long? = null
+    private var longPressTriggered = false
+    private var longPressDragLastX = 0f
+    private var longPressDragLastY = 0f
+    private val longPressTimeoutMs = ViewConfiguration.getLongPressTimeout().toLong()
+    private val longPressRunnable = Runnable {
+        val id = longPressImageId
+        if (id != null && !hadSecondFinger) {
+            longPressTriggered = true
+            selectImage(id)
+            parent?.requestDisallowInterceptTouchEvent(true)
+            longPressDragLastX = downX
+            longPressDragLastY = downY
+            performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        }
+    }
+
     private val imagePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
     private val selectedBoxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -158,11 +193,25 @@ class InteractivePreviewView @JvmOverloads constructor(
                 downY = event.y
                 downTime = System.currentTimeMillis()
                 hadSecondFinger = false
+                longPressTriggered = false
                 imagesAtGestureStart = placedImages
+
+                if (width > 0 && height > 0 && !isOnAnyDeleteButton(downX, downY)) {
+                    val hit = ImagePrep.hitTestPlacedImage(placedImages, downX, downY, width, height)
+                    longPressImageId = hit?.id
+                    if (hit != null) {
+                        removeCallbacks(longPressRunnable)
+                        postDelayed(longPressRunnable, longPressTimeoutMs)
+                    }
+                } else {
+                    longPressImageId = null
+                }
             }
             MotionEvent.ACTION_POINTER_DOWN -> {
                 if (event.pointerCount >= 2) {
                     hadSecondFinger = true
+                    removeCallbacks(longPressRunnable)
+                    longPressTriggered = false
                     parent?.requestDisallowInterceptTouchEvent(true)
                     twoFingerGestureActive = true
                     if (selectedImageId == null && width > 0 && height > 0) {
@@ -214,13 +263,48 @@ class InteractivePreviewView @JvmOverloads constructor(
                         )
                         placedImages = placedImages.map { if (it.id == selId) updated else it }
                     }
+                } else if (event.pointerCount == 1) {
+                    if (longPressTriggered) {
+                        // Pure reposition: translate only, never touching
+                        // scale or rotation, per the request that
+                        // long-press-drag should move without also
+                        // zooming/rotating.
+                        val id = longPressImageId
+                        if (id != null && width > 0 && height > 0) {
+                            val dx = event.x - longPressDragLastX
+                            val dy = event.y - longPressDragLastY
+                            placedImages = placedImages.map {
+                                if (it.id == id) {
+                                    it.copy(
+                                        centerXFraction = it.centerXFraction + dx / width,
+                                        centerYFraction = it.centerYFraction + dy / height,
+                                    )
+                                } else it
+                            }
+                            longPressDragLastX = event.x
+                            longPressDragLastY = event.y
+                        }
+                    } else {
+                        // Long press hasn't fired yet -- if the finger has
+                        // moved enough that this clearly isn't a hold, cancel
+                        // the pending long-press so it doesn't fire later and
+                        // hijack what's really an ordinary scroll gesture.
+                        val dx = event.x - downX
+                        val dy = event.y - downY
+                        if (Math.sqrt((dx * dx + dy * dy).toDouble()) > tapSlopPx) {
+                            removeCallbacks(longPressRunnable)
+                        }
+                    }
                 }
             }
             MotionEvent.ACTION_UP -> {
+                removeCallbacks(longPressRunnable)
+                val wasLongPressDrag = longPressTriggered
                 twoFingerGestureActive = false
+                longPressTriggered = false
                 parent?.requestDisallowInterceptTouchEvent(false)
 
-                if (!hadSecondFinger) {
+                if (!hadSecondFinger && !wasLongPressDrag) {
                     val dx = event.x - downX
                     val dy = event.y - downY
                     val dist = Math.sqrt((dx * dx + dy * dy).toDouble())
@@ -235,7 +319,9 @@ class InteractivePreviewView @JvmOverloads constructor(
                 }
             }
             MotionEvent.ACTION_CANCEL -> {
+                removeCallbacks(longPressRunnable)
                 twoFingerGestureActive = false
+                longPressTriggered = false
                 parent?.requestDisallowInterceptTouchEvent(false)
                 if (placedImages != imagesAtGestureStart) {
                     onImagesChanged?.invoke(placedImages)
@@ -254,18 +340,30 @@ class InteractivePreviewView @JvmOverloads constructor(
     private fun handleTap(x: Float, y: Float) {
         if (width <= 0 || height <= 0) return
 
+        val deleteTarget = findDeleteButtonAt(x, y)
+        if (deleteTarget != null) {
+            deleteImage(deleteTarget)
+            return
+        }
+
+        val hit = ImagePrep.hitTestPlacedImage(placedImages, x, y, width, height)
+        selectedImageId = hit?.id
+    }
+
+    private fun isOnAnyDeleteButton(x: Float, y: Float): Boolean = findDeleteButtonAt(x, y) != null
+
+    /** Returns the id of the image whose delete button contains (x, y), if any. */
+    private fun findDeleteButtonAt(x: Float, y: Float): Long? {
+        if (width <= 0 || height <= 0) return null
         for (image in placedImages.asReversed()) {
             val pos = ImagePrep.deleteButtonScreenPosition(image, width, height)
             val dx = x - pos[0]
             val dy = y - pos[1]
             if (Math.sqrt((dx * dx + dy * dy).toDouble()) <= deleteButtonRadiusPx) {
-                deleteImage(image.id)
-                return
+                return image.id
             }
         }
-
-        val hit = ImagePrep.hitTestPlacedImage(placedImages, x, y, width, height)
-        selectedImageId = hit?.id
+        return null
     }
 
     private fun deleteImage(id: Long) {
